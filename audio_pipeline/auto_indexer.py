@@ -116,6 +116,25 @@ def index_unknown_track(filepath: str, metadata_path: str, collection, known_fin
         
     embedding = result.pop("embedding") # Remover do dict
     result["fingerprint"] = new_fp # Adicionar o fingerprint
+
+    # Atribuição incremental de cluster se modelo K-Means existir
+    assigned_cluster = None
+    try:
+        from pathlib import Path
+        import clustering
+        model_path = Path(__file__).parent / "models" / "cluster_model.joblib"
+        cluster_model = clustering.load_cluster_model(model_path)
+        if cluster_model:
+            assigned_cluster = clustering.assign_cluster_incremental(np.array(embedding), cluster_model)
+            if assigned_cluster:
+                result["cluster_id"] = assigned_cluster
+                logger.info(f"Faixa atribuída incrementalmente ao {assigned_cluster}.")
+    except Exception as e:
+        logger.warning(f"Não foi possível atribuir cluster incrementalmente: {e}")
+
+    meta_to_insert = {"filename": filename, "subgenero": subgenero}
+    if assigned_cluster:
+        meta_to_insert["cluster_id"] = assigned_cluster
     
     # Inserir no ChromaDB usando upsert
     try:
@@ -125,7 +144,7 @@ def index_unknown_track(filepath: str, metadata_path: str, collection, known_fin
         collection.upsert(
             ids=[new_track_id],
             embeddings=[embedding],
-            metadatas=[{"filename": filename, "subgenero": subgenero}]
+            metadatas=[meta_to_insert]
         )
     except Exception as e:
         logger.error(f"Erro ao inserir {new_track_id} no ChromaDB: {e}")

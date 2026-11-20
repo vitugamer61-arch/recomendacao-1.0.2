@@ -9,3 +9,6 @@ pandas
 matplotlib
 python-mpd2
 pyacoustid
+scikit-learn
+joblib
+umap-learn

@@ -235,9 +235,14 @@ def select_next_recommendations(
     selection_mode: str = SELECTION_MODE,
     top_n: int = TOP_N_VARIETY,
     random_seed: int | None = RANDOM_SEED,
-    msg_queue: queue.Queue = None
+    msg_queue: queue.Queue = None,
+    recommendation_mode: str = "similarity"
 ) -> tuple[str, dict, int] | None:
-    """Seleciona a melhor candidata evitando histórico, fila atual e faixas com falha."""
+    """
+    Seleciona a melhor candidata evitando histórico, fila atual e faixas com falha.
+    Suporta recommendation_mode='similarity' (K-NN padrão) ou recommendation_mode='cluster'
+    (prioriza faixas pertencentes ao mesmo cluster sonoro da faixa atual).
+    """
     if history is None:
         history = []
     if queued_files is None:
@@ -245,15 +250,59 @@ def select_next_recommendations(
     if failed_tracks is None:
         failed_tracks = set()
 
-    result = collection.get(ids=[current_track_id], include=["embeddings"])
+    result = collection.get(ids=[current_track_id], include=["embeddings", "metadatas"])
     embeddings_list = result.get('embeddings')
     if embeddings_list is None or len(embeddings_list) == 0:
         return None
 
     import numpy as np
     query_emb = np.array(result['embeddings'][0])
+    current_meta = result.get('metadatas', [{}])[0] if result.get('metadatas') else {}
+    current_cluster = current_meta.get('cluster_id') if current_meta else None
 
-    similares = vector_store.query_similar(collection, query_emb, k=k, exclude_id=current_track_id)
+    similares = []
+
+    # Se modo for cluster e houver cluster válido associado
+    if recommendation_mode == "cluster" and current_cluster and current_cluster != "ruido":
+        try:
+            cluster_tracks = collection.get(
+                where={"cluster_id": current_cluster},
+                include=["embeddings", "metadatas"]
+            )
+            c_ids = cluster_tracks.get("ids", [])
+            c_embs = cluster_tracks.get("embeddings", [])
+            c_metas = cluster_tracks.get("metadatas", [])
+
+            cluster_candidates = []
+            norm_q = query_emb / (np.linalg.norm(query_emb) + 1e-9)
+
+            for cid, cemb, cmeta in zip(c_ids, c_embs, c_metas):
+                if cid == current_track_id:
+                    continue
+                emb_arr = np.array(cemb)
+                norm_c = emb_arr / (np.linalg.norm(emb_arr) + 1e-9)
+                cos_sim = float(np.dot(norm_q, norm_c))
+                dist = 1.0 - cos_sim
+                cluster_candidates.append({
+                    "track_id": cid,
+                    "filename": cmeta.get("filename", "") if cmeta else "",
+                    "distance": dist,
+                    "subgenero": cmeta.get("subgenero", "") if cmeta else "",
+                    "cluster_id": current_cluster
+                })
+
+            # Ordena por menor distância (maior similaridade dentro do cluster)
+            cluster_candidates.sort(key=lambda x: x["distance"])
+            similares = cluster_candidates[:k]
+            if similares and msg_queue:
+                msg_queue.put({"type": "log", "text": f"Modo Cluster ativo: {current_cluster} ({len(similares)} candidatas)"})
+        except Exception as e:
+            logging.warning(f"Erro ao consultar faixas do mesmo cluster '{current_cluster}': {e}. Usando fallback K-NN.")
+
+    # Se não for modo cluster ou não retornou candidatas, usa K-NN padrão
+    if not similares:
+        similares = vector_store.query_similar(collection, query_emb, k=k, exclude_id=current_track_id)
+
     if not similares:
         return None
 
@@ -329,7 +378,8 @@ def replenish_mpd_queue(
     random_seed: int | None = RANDOM_SEED,
     msg_queue: queue.Queue = None,
     on_rec_success: callable = None,
-    on_error: callable = None
+    on_error: callable = None,
+    recommendation_mode: str = "similarity"
 ) -> int:
     """Garante que a fila do MPD tenha pelo menos `min_queue_ahead` faixas à frente da atual."""
     playlist = client.playlistinfo()
@@ -366,7 +416,8 @@ def replenish_mpd_queue(
             selection_mode=selection_mode,
             top_n=top_n,
             random_seed=random_seed,
-            msg_queue=msg_queue
+            msg_queue=msg_queue,
+            recommendation_mode=recommendation_mode
         )
 
         if not selection:
@@ -411,7 +462,7 @@ def replenish_mpd_queue(
 
     return added_count
 
-def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, id_to_file_map: dict, trigger_mode: str = "on_change", music_root: str = "", metadata_path: str = "", known_fingerprints: dict = None, msg_queue: queue.Queue = None) -> None:
+def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, id_to_file_map: dict, trigger_mode: str = "on_change", music_root: str = "", metadata_path: str = "", known_fingerprints: dict = None, msg_queue: queue.Queue = None, recommendation_mode: str = "similarity") -> None:
     """Loop principal que aguarda mudanças no MPD e enfileira recomendações com garantia de reposição."""
     if known_fingerprints is None:
         known_fingerprints = {}
@@ -420,7 +471,7 @@ def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, i
     # Limitar HISTORY_SIZE a no máximo 50% das faixas indexadas
     total_indexed = max(1, len(file_to_id_map))
     effective_history_size = min(HISTORY_SIZE_DEFAULT, max(2, total_indexed // 2))
-    logging.info(f"Tamanho do histórico de sessão configurado: {effective_history_size} faixas (total indexado: {total_indexed}).")
+    logging.info(f"Tamanho do histórico de sessão configurado: {effective_history_size} faixas (total indexado: {total_indexed}). Modo de recomendação: {recommendation_mode}.")
 
     play_history = load_session_history(SESSION_HISTORY_FILE, max_len=effective_history_size)
     failed_tracks = set()
@@ -533,7 +584,8 @@ def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, i
                         max_tries=MAX_REPLENISH_TRIES,
                         msg_queue=msg_queue,
                         on_rec_success=handle_rec_success,
-                        on_error=handle_err
+                        on_error=handle_err,
+                        recommendation_mode=recommendation_mode
                     )
 
                 elif state == "stop":
@@ -560,7 +612,8 @@ def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, i
                                 max_tries=MAX_REPLENISH_TRIES,
                                 msg_queue=msg_queue,
                                 on_rec_success=handle_rec_success,
-                                on_error=handle_err
+                                on_error=handle_err,
+                                recommendation_mode=recommendation_mode
                             )
                             # Se a constante permitir, retoma a reprodução automaticamente
                             if AUTO_RESUME_PLAY_ON_STOP:
@@ -587,6 +640,8 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=int, default=1, help="Quantidade de recomendações a consultar")
     parser.add_argument("--trigger_mode", type=str, choices=["on_change", "near_end"], default="on_change")
     parser.add_argument("--music_root", type=str, help="Caminho absoluto da biblioteca (pula prompt)")
+    parser.add_argument("--mode", type=str, choices=["similarity", "cluster"], default="similarity", help="Modo de recomendação: similarity (K-NN sonoro padrão) ou cluster (faixas do mesmo cluster)")
+    parser.add_argument("--exportar-playlists", action="store_true", help="Exporta uma playlist por cluster para o MPD e sai")
     
     args = parser.parse_args()
     
@@ -645,6 +700,26 @@ if __name__ == "__main__":
     # 3. Conectar ChromaDB
     chroma_client = vector_store.get_client(config.CHROMA_PERSIST_DIR)
     collection = vector_store.get_or_create_collection(chroma_client, config.COLLECTION_NAME)
+
+    # Caso seja apenas exportação de playlists
+    if args.exportar_playlists:
+        import clustering
+        clusters_json = os.path.join(os.path.dirname(os.path.abspath(args.metadata)), "clusters.json")
+        if not os.path.exists(clusters_json):
+            logging.error(f"Arquivo {clusters_json} não encontrado. Execute 'python clustering.py' primeiro.")
+            exit(1)
+        with open(clusters_json, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        playlists_dir = Path(__file__).parent / "playlists"
+        clustering.export_playlists_to_mpd(
+            clusters_summary=summary,
+            id_to_file_map=id_to_file,
+            host=config.MPD_HOST,
+            port=config.MPD_PORT,
+            m3u_dir=playlists_dir
+        )
+        logging.info("Exportação de playlists concluída. Encerrando.")
+        exit(0)
     
     # 4. Conectar MPD
     try:
@@ -653,13 +728,17 @@ if __name__ == "__main__":
         logging.info("Conectado com sucesso.")
         
         print("\n=============================================")
-        print("Sistema de Recomendação Ativo e Monitorando...")
+        print(f"Sistema de Recomendação Ativo (Modo: {args.mode}) e Monitorando...")
         print("=============================================\n")
         
         msg_queue = queue.Queue()
         
         # 5. Loop principal em Background Thread
-        mpd_thread = threading.Thread(target=monitor_and_recommend, args=(mpd_client, collection, file_to_id, id_to_file, args.trigger_mode, music_root, args.metadata, known_fingerprints, msg_queue), daemon=True)
+        mpd_thread = threading.Thread(
+            target=monitor_and_recommend,
+            args=(mpd_client, collection, file_to_id, id_to_file, args.trigger_mode, music_root, args.metadata, known_fingerprints, msg_queue, args.mode),
+            daemon=True
+        )
         mpd_thread.start()
         
         # 6. Iniciar Janela de Status na Thread Principal

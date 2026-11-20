@@ -23,6 +23,9 @@ mpd/music/
 audio_pipeline/results/
 audio_pipeline/output/
 audio_pipeline/chroma_db/
+audio_pipeline/chroma_db_backup_*/
+audio_pipeline/models/
+audio_pipeline/playlists/
 chroma_db/
 metadata.json
 

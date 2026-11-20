@@ -209,6 +209,17 @@ def indexar(
         logger.info("Nada a fazer. ChromaDB já está atualizado.")
         return {"processadas": 0, "falhas": 0, "puladas": n_ja_indexadas}
 
+    # Carregar modelo de clusterização para atribuição incremental caso exista
+    cluster_model = None
+    try:
+        import clustering
+        model_path = _SCRIPT_DIR / "models" / "cluster_model.joblib"
+        cluster_model = clustering.load_cluster_model(model_path)
+        if cluster_model:
+            logger.info("Modelo de clusterização carregado para atribuição incremental em novas faixas.")
+    except Exception:
+        cluster_model = None
+
     # Lote de inserção
     lote_ids: list[str]       = []
     lote_embs: list[list]     = []
@@ -277,9 +288,20 @@ def indexar(
             resultado["filepath"]  = track_id
             resultado["subgenero"] = subgenero
 
+            meta_item = {"filename": filepath.name, "subgenero": subgenero}
+            if cluster_model:
+                try:
+                    import clustering
+                    cid = clustering.assign_cluster_incremental(embedding, cluster_model)
+                    if cid:
+                        resultado["cluster_id"] = cid
+                        meta_item["cluster_id"] = cid
+                except Exception:
+                    pass
+
             lote_ids.append(track_id)
             lote_embs.append(embedding.tolist())
-            lote_metas.append({"filename": filepath.name, "subgenero": subgenero})
+            lote_metas.append(meta_item)
             lote_json.append(resultado)
             n_ok += 1
 
