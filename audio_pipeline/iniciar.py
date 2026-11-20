@@ -18,6 +18,7 @@ import socket
 import logging
 import argparse
 import subprocess
+import webbrowser
 from pathlib import Path
 
 # Garante path de importação local
@@ -44,6 +45,46 @@ def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
             return True
     except (socket.timeout, ConnectionRefusedError, OSError):
         return False
+
+
+def liberar_porta(porta: int) -> None:
+    """Encerra processos órfãos que possam estar prendendo a porta especificada no Windows."""
+    if os.name != "nt":
+        return
+    try:
+        cmd = f"netstat -ano | findstr :{porta}"
+        out = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+        pids = set()
+        for line in out.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and "LISTENING" in parts:
+                pids.add(parts[-1])
+        for pid in pids:
+            if pid and pid != "0":
+                logger.info(f"Liberando porta {porta}: encerrando processo órfão anterior (PID {pid})...")
+                subprocess.run(f"taskkill /F /T /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+
+def encerrar_processo(proc: subprocess.Popen) -> None:
+    """Encerra com segurança um processo e toda a sua árvore de processos filhos."""
+    if proc is None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                f"taskkill /F /T /PID {proc.pid}",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        else:
+            proc.terminate()
+            proc.wait(timeout=3)
+    except Exception as e:
+        logger.warning(f"Erro ao encerrar processo: {e}")
 
 
 def etapa_1_mpd(
@@ -281,25 +322,63 @@ def main():
             etapa_4_playlists(music_root)
 
         # Etapa 5: Iniciar Monitor de Precisão (Dashboard Streamlit) em paralelo
+        monitor_log_file = None
         if not args.sem_monitor:
             dashboard_path = Path(config.DASHBOARD_PATH)
             if dashboard_path.exists():
                 try:
+                    # Garante que a pasta de logs existe e prepara o arquivo de saída
+                    logs_dir = Path(config.PROJECT_ROOT) / "logs"
+                    logs_dir.mkdir(parents=True, exist_ok=True)
+                    monitor_log_path = logs_dir / "monitor.log"
+                    monitor_log_file = open(monitor_log_path, "w", encoding="utf-8")
+
+                    # Libera a porta 8501 se houver processo órfão de execução anterior
+                    liberar_porta(config.STREAMLIT_PORT)
+
                     monitor_cmd = [
                         sys.executable, "-m", "streamlit", "run",
                         str(dashboard_path),
                         "--server.port", str(config.STREAMLIT_PORT),
-                        "--server.headless", "true"
+                        "--server.headless", "true",
+                        "--browser.gatherUsageStats", "false"
                     ]
                     monitor_proc = subprocess.Popen(
                         monitor_cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE
+                        stdout=monitor_log_file,
+                        stderr=subprocess.STDOUT,
+                        cwd=str(config.PROJECT_ROOT)
                     )
-                    logger.info(
-                        f"[5/6] [OK] Monitor de Precisão (Streamlit) iniciado em "
-                        f"http://localhost:{config.STREAMLIT_PORT}"
-                    )
+
+                    # Aguarda até 5 segundos para confirmar que o Streamlit iniciou e está ouvindo
+                    t_inicio = time.time()
+                    monitor_online = False
+                    while time.time() - t_inicio < 5.0:
+                        if monitor_proc.poll() is not None:
+                            break
+                        if is_port_open("localhost", config.STREAMLIT_PORT, timeout=0.5):
+                            monitor_online = True
+                            break
+                        time.sleep(0.5)
+
+                    if monitor_online:
+                        monitor_url = f"http://localhost:{config.STREAMLIT_PORT}"
+                        logger.info(
+                            f"[5/6] [OK] Monitor de Precisão (Streamlit) ativo em {monitor_url} "
+                            f"(logs em: {monitor_log_path})"
+                        )
+                        # Abre automaticamente a interface no navegador do usuário
+                        try:
+                            webbrowser.open(monitor_url)
+                        except Exception:
+                            pass
+                    else:
+                        ret_code = monitor_proc.poll()
+                        logger.warning(
+                            f"[5/6] [AVISO] Monitor de Precisão não respondeu na porta {config.STREAMLIT_PORT} "
+                            f"(código de saída: {ret_code}). Consulte {monitor_log_path} para detalhes. "
+                            f"O recomendador continuará normalmente."
+                        )
                 except Exception as e:
                     logger.warning(
                         f"[5/6] [AVISO] Falha ao iniciar Monitor de Precisão: {e}. "
@@ -328,19 +407,16 @@ def main():
         logger.error("O processo foi interrompido para evitar inconsistências. Verifique a mensagem acima.")
         sys.exit(1)
     finally:
-        # Encerramento limpo do Monitor de Precisão (sem processo órfão)
+        # Encerramento limpo do Monitor de Precisão (sem processos órfãos)
         if monitor_proc is not None:
             logger.info("Encerrando Monitor de Precisão (Streamlit)...")
+            encerrar_processo(monitor_proc)
+            logger.info("Monitor de Precisão encerrado com sucesso.")
+        if monitor_log_file is not None and not monitor_log_file.closed:
             try:
-                monitor_proc.terminate()
-                monitor_proc.wait(timeout=5)
-                logger.info("Monitor de Precisão encerrado com sucesso.")
-            except subprocess.TimeoutExpired:
-                logger.warning("Monitor de Precisão não respondeu ao terminate. Forçando kill...")
-                monitor_proc.kill()
-                monitor_proc.wait(timeout=3)
-            except Exception as e:
-                logger.warning(f"Erro ao encerrar Monitor de Precisão: {e}")
+                monitor_log_file.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
