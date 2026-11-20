@@ -634,74 +634,109 @@ def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, i
                 msg_queue.put({"type": "log", "text": f"Erro: {e}"})
                 msg_queue.put({"type": "status", "state": "monitorando"})
 
+def run_recommender(
+    metadata_path: str = None,
+    music_root: str = None,
+    mode: str = "cluster",
+    trigger_mode: str = "on_change",
+    gui: bool = True
+) -> None:
+    """
+    Ponto de entrada público para executar o recomendador em primeiro plano.
+    Reaproveitado tanto pelo CLI do mpd_integration quanto pelo iniciar.py.
+    """
+    if metadata_path is None:
+        metadata_path = config.METADATA_PATH
+    if music_root is None:
+        music_root = config.get_music_library_root(config.MPD_CONF_PATH)
+
+    music_root = os.path.abspath(music_root)
+    logging.info(f"Iniciando Recomendador Musical. Pasta base: {music_root}")
+
+    # 1. Carregar metadados e mapear caminhos
+    logging.info("Construindo mapeamento de arquivos...")
+    file_to_id, id_to_file = build_file_to_id_map(metadata_path, music_root)
+    if not file_to_id:
+        raise ValueError(f"Nenhum arquivo mapeado a partir de {metadata_path}!")
+
+    logging.info(f"Total de {len(file_to_id)} faixas mapeadas.")
+
+    # 2. Carregar fingerprints
+    known_fingerprints = auto_indexer.load_known_fingerprints(metadata_path)
+
+    # 3. Conectar ChromaDB
+    chroma_client = vector_store.get_client(config.CHROMA_PERSIST_DIR)
+    collection = vector_store.get_or_create_collection(chroma_client, config.COLLECTION_NAME)
+
+    # 4. Conectar MPD
+    mpd_client = connect_mpd(config.MPD_HOST, config.MPD_PORT)
+    logging.info(f"Conectado ao MPD em {config.MPD_HOST}:{config.MPD_PORT}.")
+
+    print("\n=============================================")
+    print(f"Sistema de Recomendação Ativo (Modo: {mode}) e Monitorando...")
+    print("Pressione Ctrl+C para encerrar.")
+    print("=============================================\n")
+
+    msg_queue = queue.Queue()
+
+    # 5. Loop principal em Background Thread
+    mpd_thread = threading.Thread(
+        target=monitor_and_recommend,
+        args=(mpd_client, collection, file_to_id, id_to_file, trigger_mode, music_root, metadata_path, known_fingerprints, msg_queue, mode),
+        daemon=True
+    )
+    mpd_thread.start()
+
+    # 6. Modo de exibição: Janela GUI ou Terminal
+    try:
+        if gui:
+            win = status_window.StatusWindow(msg_queue)
+            win.start()
+        else:
+            # Modo Console: consome logs da fila e aguarda Ctrl+C
+            while mpd_thread.is_alive():
+                try:
+                    msg = msg_queue.get(timeout=1.0)
+                    if msg.get("type") in ["log", "recommendation", "event"]:
+                        logging.info(f"[{msg.get('type').upper()}] {msg.get('text', msg.get('name', ''))}")
+                except queue.Empty:
+                    pass
+    except KeyboardInterrupt:
+        logging.info("\nEncerrando sistema de recomendação graciosamente...")
+    finally:
+        try:
+            mpd_client.disconnect()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Integração do MPD com o Recomendador")
-    parser.add_argument("--metadata", type=str, required=True, help="Caminho do metadata.json")
+    parser.add_argument("--metadata", type=str, default=config.METADATA_PATH, help="Caminho do metadata.json")
     parser.add_argument("--k", type=int, default=1, help="Quantidade de recomendações a consultar")
     parser.add_argument("--trigger_mode", type=str, choices=["on_change", "near_end"], default="on_change")
     parser.add_argument("--music_root", type=str, help="Caminho absoluto da biblioteca (pula prompt)")
-    parser.add_argument("--mode", type=str, choices=["similarity", "cluster"], default="similarity", help="Modo de recomendação: similarity (K-NN sonoro padrão) ou cluster (faixas do mesmo cluster)")
+    parser.add_argument("--mode", type=str, choices=["similarity", "cluster"], default="similarity", help="Modo de recomendação")
     parser.add_argument("--exportar-playlists", action="store_true", help="Exporta uma playlist por cluster para o MPD e sai")
+    parser.add_argument("--no-gui", action="store_true", help="Executa apenas no console sem abrir janela gráfica")
     
     args = parser.parse_args()
-    
+
     # 1. Determinar raiz da biblioteca
     if args.music_root:
         if not os.path.exists(args.music_root):
             logging.error(f"O caminho --music_root fornecido não existe: {args.music_root}")
             exit(1)
-        music_root = os.path.abspath(args.music_root)
+        m_root = os.path.abspath(args.music_root)
     else:
-        # Tenta carregar do last_music_root.txt primeiro
-        default_root = None
-        if os.path.exists("last_music_root.txt"):
-            with open("last_music_root.txt", "r", encoding="utf-8") as f:
-                default_root = f.read().strip()
-        
-        # Se não houver, tenta do mpd.conf
-        if not default_root:
-            default_root = config.get_music_library_root(config.MPD_CONF_PATH)
-            
+        default_root = config.get_music_library_root(config.MPD_CONF_PATH)
         try:
-            music_root = prompt_music_library_root(default_root)
+            m_root = prompt_music_library_root(default_root)
         except KeyboardInterrupt:
             logging.info("Interrompido pelo usuário.")
             exit(0)
-            
-    # 2. Carregar metadados e mapear caminhos
-    logging.info("Construindo mapeamento de arquivos...")
-    file_to_id, id_to_file = build_file_to_id_map(args.metadata, music_root)
-    
-    if not file_to_id:
-        logging.error("Nenhum arquivo mapeado a partir do metadata.json!")
-        exit(1)
-        
-    logging.info(f"Total de {len(file_to_id)} faixas mapeadas.")
-    
-    # Valida se pelo menos 1 arquivo mapeado realmente existe no sistema de arquivos para avisar o usuário
-    # Isso é apenas informativo
-    valid_files_count = 0
-    for rel_path in file_to_id.keys():
-        abs_p = os.path.join(music_root, rel_path)
-        if os.path.exists(abs_p):
-            valid_files_count += 1
-            break
-            
-    if valid_files_count == 0:
-        logging.warning("CUIDADO: O mapeamento foi criado, mas o primeiro arquivo testado não foi encontrado fisicamente na pasta base.")
-        logging.warning("Pode haver um problema na definição do diretório de músicas ou na normalização.")
-        # Não damos exit pois o MPD pode estar em outra máquina onde o caminho é válido, mas localmente não,
-        # ou se usou um diretório virtual.
-        
-    # Carregar fingerprints
-    logging.info("Carregando fingerprints conhecidos...")
-    known_fingerprints = auto_indexer.load_known_fingerprints(args.metadata)
-    
-    # 3. Conectar ChromaDB
-    chroma_client = vector_store.get_client(config.CHROMA_PERSIST_DIR)
-    collection = vector_store.get_or_create_collection(chroma_client, config.COLLECTION_NAME)
 
-    # Caso seja apenas exportação de playlists
+    # 2. Caso seja apenas exportação de playlists
     if args.exportar_playlists:
         import clustering
         clusters_json = os.path.join(os.path.dirname(os.path.abspath(args.metadata)), "clusters.json")
@@ -710,6 +745,7 @@ if __name__ == "__main__":
             exit(1)
         with open(clusters_json, "r", encoding="utf-8") as f:
             summary = json.load(f)
+        _, id_to_file = build_file_to_id_map(args.metadata, m_root)
         playlists_dir = Path(__file__).parent / "playlists"
         clustering.export_playlists_to_mpd(
             clusters_summary=summary,
@@ -720,36 +756,13 @@ if __name__ == "__main__":
         )
         logging.info("Exportação de playlists concluída. Encerrando.")
         exit(0)
-    
-    # 4. Conectar MPD
-    try:
-        logging.info(f"Conectando ao MPD em {config.MPD_HOST}:{config.MPD_PORT}...")
-        mpd_client = connect_mpd(config.MPD_HOST, config.MPD_PORT)
-        logging.info("Conectado com sucesso.")
-        
-        print("\n=============================================")
-        print(f"Sistema de Recomendação Ativo (Modo: {args.mode}) e Monitorando...")
-        print("=============================================\n")
-        
-        msg_queue = queue.Queue()
-        
-        # 5. Loop principal em Background Thread
-        mpd_thread = threading.Thread(
-            target=monitor_and_recommend,
-            args=(mpd_client, collection, file_to_id, id_to_file, args.trigger_mode, music_root, args.metadata, known_fingerprints, msg_queue, args.mode),
-            daemon=True
-        )
-        mpd_thread.start()
-        
-        # 6. Iniciar Janela de Status na Thread Principal
-        win = status_window.StatusWindow(msg_queue)
-        win.start()
-        
-    except KeyboardInterrupt:
-        logging.info("\nEncerrando sistema (KeyboardInterrupt)...")
-    finally:
-        try:
-            if 'mpd_client' in locals():
-                mpd_client.disconnect()
-        except:
-            pass
+
+    # 3. Execução normal do recomendador
+    run_recommender(
+        metadata_path=args.metadata,
+        music_root=m_root,
+        mode=args.mode,
+        trigger_mode=args.trigger_mode,
+        gui=not args.no_gui
+    )
+

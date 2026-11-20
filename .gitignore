@@ -22,6 +22,7 @@ mpd/music/
 # Bancos de dados e saidas geradas
 audio_pipeline/results/
 audio_pipeline/output/
+audio_pipeline/log/
 audio_pipeline/chroma_db/
 audio_pipeline/chroma_db_backup_*/
 audio_pipeline/models/
