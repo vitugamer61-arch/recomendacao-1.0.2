@@ -1,12 +1,13 @@
 """
 iniciar.py — Ponto de entrada único para o sistema de recomendação e clusterização musical.
 
-Orquestra todo o fluxo em 5 etapas consecutivas:
+Orquestra todo o fluxo em 6 etapas consecutivas:
 1. Verificação e inicialização automática do MPD (porta 6600).
 2. Verificação do ChromaDB e indexação automática de novas faixas da pasta de músicas.
 3. Clusterização: execução do K-Means automático ou atribuição incremental de novas faixas.
 4. Sincronização de playlists por cluster no MPD e em arquivos .m3u.
-5. Inicialização do recomendador em primeiro plano no modo "mais faixas do mesmo cluster".
+5. Inicialização do Monitor de Precisão (Dashboard Streamlit) em processo paralelo.
+6. Inicialização do recomendador em primeiro plano no modo "mais faixas do mesmo cluster".
 """
 
 import os
@@ -56,13 +57,13 @@ def etapa_1_mpd(
     Etapa 1: Verifica se o servidor MPD está ativo na porta configurada.
     Se não estiver, inicia o executável e aguarda ficar pronto.
     """
-    logger.info(f"[1/5] Verificando servidor MPD em {host}:{port}...")
+    logger.info(f"[1/6] Verificando servidor MPD em {host}:{port}...")
 
     if is_port_open(host, port):
-        logger.info(f"[1/5] [OK] Servidor MPD já está ativo e respondendo na porta {port}.")
+        logger.info(f"[1/6] [OK] Servidor MPD já está ativo e respondendo na porta {port}.")
         return
 
-    logger.warning(f"[1/5] MPD não detectado na porta {port}. Iniciando servidor local...")
+    logger.warning(f"[1/6] MPD não detectado na porta {port}. Iniciando servidor local...")
 
     if not os.path.exists(exe_path):
         raise FileNotFoundError(
@@ -93,7 +94,7 @@ def etapa_1_mpd(
     t_start = time.time()
     while time.time() - t_start < timeout:
         if is_port_open(host, port, timeout=0.5):
-            logger.info(f"[1/5] [OK] Servidor MPD iniciado e pronto para conexões na porta {port}.")
+            logger.info(f"[1/6] [OK] Servidor MPD iniciado e pronto para conexões na porta {port}.")
             return
         time.sleep(0.5)
 
@@ -109,7 +110,7 @@ def etapa_2_indexacao(music_root: Path, collection) -> bool:
     e indexa novas faixas automaticamente.
     Retorna True se houve faixas novas indexadas, False caso contrário.
     """
-    logger.info(f"[2/5] Verificando integridade da biblioteca em '{music_root}' contra o ChromaDB...")
+    logger.info(f"[2/6] Verificando integridade da biblioteca em '{music_root}' contra o ChromaDB...")
 
     if not music_root.exists():
         raise FileNotFoundError(
@@ -124,10 +125,10 @@ def etapa_2_indexacao(music_root: Path, collection) -> bool:
     pendentes = [f for f in arquivos if index_library._rel_id(f, music_root) not in ids_existentes]
 
     if not pendentes:
-        logger.info(f"[2/5] [OK] ChromaDB atualizado: {len(ids_existentes)} faixas catalogadas, nenhuma nova pendente.")
+        logger.info(f"[2/6] [OK] ChromaDB atualizado: {len(ids_existentes)} faixas catalogadas, nenhuma nova pendente.")
         return False
 
-    logger.info(f"[2/5] Encontradas {len(pendentes)} faixas novas na biblioteca. Indexando...")
+    logger.info(f"[2/6] Encontradas {len(pendentes)} faixas novas na biblioteca. Indexando...")
     resultado = index_library.indexar(
         root=music_root,
         collection=collection,
@@ -135,7 +136,7 @@ def etapa_2_indexacao(music_root: Path, collection) -> bool:
         limit=None,
         reindex=False
     )
-    logger.info(f"[2/5] [OK] Indexação concluída: {resultado['processadas']} faixas adicionadas ao ChromaDB.")
+    logger.info(f"[2/6] [OK] Indexação concluída: {resultado['processadas']} faixas adicionadas ao ChromaDB.")
     return resultado["processadas"] > 0
 
 
@@ -150,7 +151,7 @@ def etapa_3_clusterizacao(
     - Se modelo já existe e novas faixas: os clusters já foram atribuídos incrementalmente.
     - Se já calibrado e sem novas faixas: reaproveita sem recalcular.
     """
-    logger.info("[3/5] Verificando modelos de clusterização...")
+    logger.info("[3/6] Verificando modelos de clusterização...")
 
     model_path = Path(config.CLUSTER_MODEL_PATH)
     clusters_json_path = Path(config.CLUSTERS_JSON_PATH)
@@ -159,7 +160,7 @@ def etapa_3_clusterizacao(
 
     if deve_recalcular:
         motivo = "Solicitação explícita (--recalcular)" if recalcular else "Modelo não encontrado"
-        logger.info(f"[3/5] Executando clusterização completa ({motivo})...")
+        logger.info(f"[3/6] Executando clusterização completa ({motivo})...")
         res = clustering.run_clustering_pipeline(
             k_arg="auto",
             k_min=4,
@@ -171,23 +172,23 @@ def etapa_3_clusterizacao(
             recalculate=True,
             skip_backup=False
         )
-        logger.info(f"[3/5] [OK] Clusterização finalizada com sucesso: {res['n_clusters']} clusters calibrados.")
+        logger.info(f"[3/6] [OK] Clusterização finalizada com sucesso: {res['n_clusters']} clusters calibrados.")
     else:
         if novas_faixas:
-            logger.info("[3/5] [OK] Novas faixas atribuídas incrementalmente aos clusters existentes.")
+            logger.info("[3/6] [OK] Novas faixas atribuídas incrementalmente aos clusters existentes.")
         else:
-            logger.info("[3/5] [OK] Clusters já calibrados e persistidos no ChromaDB. Reagrupamento dispensado.")
+            logger.info("[3/6] [OK] Clusters já calibrados e persistidos no ChromaDB. Reagrupamento dispensado.")
 
 
 def etapa_4_playlists(music_root: Path) -> None:
     """
     Etapa 4: Atualiza as playlists por cluster no MPD e grava arquivos .m3u.
     """
-    logger.info("[4/5] Sincronizando playlists por cluster no MPD...")
+    logger.info("[4/6] Sincronizando playlists por cluster no MPD...")
 
     clusters_json = Path(config.CLUSTERS_JSON_PATH)
     if not clusters_json.exists():
-        logger.warning(f"[4/5] {clusters_json} não encontrado. Pulando geração de playlists.")
+        logger.warning(f"[4/6] {clusters_json} não encontrado. Pulando geração de playlists.")
         return
 
     with open(clusters_json, "r", encoding="utf-8") as f:
@@ -204,18 +205,18 @@ def etapa_4_playlists(music_root: Path) -> None:
         port=config.MPD_PORT,
         m3u_dir=playlists_dir
     )
-    logger.info(f"[4/5] [OK] Playlists sincronizadas ({mpd_count} no MPD, {m3u_count} arquivos .m3u em {playlists_dir}).")
+    logger.info(f"[4/6] [OK] Playlists sincronizadas ({mpd_count} no MPD, {m3u_count} arquivos .m3u em {playlists_dir}).")
 
 
-def etapa_5_recomendador(
+def etapa_6_recomendador(
     music_root: Path,
     mode: str = "cluster",
     gui: bool = True
 ) -> None:
     """
-    Etapa 5: Inicia o sistema de recomendação em primeiro plano.
+    Etapa 6: Inicia o sistema de recomendação em primeiro plano.
     """
-    logger.info(f"[5/5] Iniciando Recomendador Musical ativo (Modo: '{mode}')...")
+    logger.info(f"[6/6] Iniciando Recomendador Musical ativo (Modo: '{mode}')...")
     mpd_integration.run_recommender(
         metadata_path=config.METADATA_PATH,
         music_root=str(music_root),
@@ -230,6 +231,7 @@ def main():
     parser.add_argument("--recalcular", action="store_true", help="Força recálculo completo da clusterização K-Means do zero")
     parser.add_argument("--sem-cluster", action="store_true", help="Inicia o recomendador no modo clássico de similaridade K-NN (sem priorizar cluster)")
     parser.add_argument("--no-gui", action="store_true", help="Executa o recomendador no console sem abrir janela gráfica Tkinter")
+    parser.add_argument("--sem-monitor", action="store_true", help="Inicia sem o Monitor de Precisão (Dashboard Streamlit)")
     parser.add_argument("--seed", type=int, default=42, help="Seed para reprodução dos cálculos de clustering")
 
     args = parser.parse_args()
@@ -246,7 +248,10 @@ def main():
     logger.info(f" Servidor MPD     : {config.MPD_HOST}:{config.MPD_PORT}")
     logger.info(f" Banco ChromaDB   : {config.CHROMA_PERSIST_DIR}")
     logger.info(f" Modo recomendador: {'similarity (sem-cluster)' if args.sem_cluster else 'cluster (mais faixas do mesmo cluster)'}")
+    logger.info(f" Monitor Precisão : {'desativado (--sem-monitor)' if args.sem_monitor else f'Streamlit na porta {config.STREAMLIT_PORT}'}")
     logger.info("============================================================\n")
+
+    monitor_proc = None
 
     try:
         # Etapa 1: MPD
@@ -275,9 +280,42 @@ def main():
         if not args.sem_cluster:
             etapa_4_playlists(music_root)
 
-        # Etapa 5: Iniciar recomendador em primeiro plano
+        # Etapa 5: Iniciar Monitor de Precisão (Dashboard Streamlit) em paralelo
+        if not args.sem_monitor:
+            dashboard_path = Path(config.DASHBOARD_PATH)
+            if dashboard_path.exists():
+                try:
+                    monitor_cmd = [
+                        sys.executable, "-m", "streamlit", "run",
+                        str(dashboard_path),
+                        "--server.port", str(config.STREAMLIT_PORT),
+                        "--server.headless", "true"
+                    ]
+                    monitor_proc = subprocess.Popen(
+                        monitor_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE
+                    )
+                    logger.info(
+                        f"[5/6] [OK] Monitor de Precisão (Streamlit) iniciado em "
+                        f"http://localhost:{config.STREAMLIT_PORT}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[5/6] [AVISO] Falha ao iniciar Monitor de Precisão: {e}. "
+                        f"O recomendador continuará normalmente sem o monitor."
+                    )
+            else:
+                logger.warning(
+                    f"[5/6] [AVISO] Dashboard não encontrado em '{dashboard_path}'. "
+                    f"Monitor de Precisão não será iniciado."
+                )
+        else:
+            logger.info("[5/6] Monitor de Precisão desativado (--sem-monitor).")
+
+        # Etapa 6: Iniciar recomendador em primeiro plano
         rec_mode = "similarity" if args.sem_cluster else "cluster"
-        etapa_5_recomendador(
+        etapa_6_recomendador(
             music_root=music_root,
             mode=rec_mode,
             gui=not args.no_gui
@@ -285,11 +323,24 @@ def main():
 
     except KeyboardInterrupt:
         logger.info("\nEncerramento solicitado pelo usuário (Ctrl+C). Sistema finalizado com sucesso.")
-        sys.exit(0)
     except Exception as e:
         logger.error(f"\n[FALHA NA EXECUÇÃO]: {e}")
         logger.error("O processo foi interrompido para evitar inconsistências. Verifique a mensagem acima.")
         sys.exit(1)
+    finally:
+        # Encerramento limpo do Monitor de Precisão (sem processo órfão)
+        if monitor_proc is not None:
+            logger.info("Encerrando Monitor de Precisão (Streamlit)...")
+            try:
+                monitor_proc.terminate()
+                monitor_proc.wait(timeout=5)
+                logger.info("Monitor de Precisão encerrado com sucesso.")
+            except subprocess.TimeoutExpired:
+                logger.warning("Monitor de Precisão não respondeu ao terminate. Forçando kill...")
+                monitor_proc.kill()
+                monitor_proc.wait(timeout=3)
+            except Exception as e:
+                logger.warning(f"Erro ao encerrar Monitor de Precisão: {e}")
 
 
 if __name__ == "__main__":

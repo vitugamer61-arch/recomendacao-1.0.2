@@ -292,10 +292,17 @@ def indexar(
             if cluster_model:
                 try:
                     import clustering
-                    cid = clustering.assign_cluster_incremental(embedding, cluster_model)
-                    if cid:
+                    assign_res = clustering.assign_cluster_incremental(embedding, cluster_model)
+                    if assign_res:
+                        if isinstance(assign_res, tuple):
+                            cid, cnome = assign_res
+                        else:
+                            cid = assign_res
+                            cnome = cid
                         resultado["cluster_id"] = cid
+                        resultado["cluster_nome"] = cnome
                         meta_item["cluster_id"] = cid
+                        meta_item["cluster_nome"] = cnome
                 except Exception:
                     pass
 

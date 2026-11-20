@@ -19,7 +19,9 @@ from clustering import (
     run_kmeans,
     run_hdbscan,
     compute_clusters_summary,
-    assign_cluster_incremental
+    assign_cluster_incremental,
+    determine_cluster_names_and_purity,
+    sanitize_playlist_name
 )
 
 class TestClustering(unittest.TestCase):
@@ -84,32 +86,56 @@ class TestClustering(unittest.TestCase):
         pca_X, pca_model = preprocess_embeddings(self.X, n_pca=10, seed=42)
         kmeans, labels, cluster_names = run_kmeans(pca_X, k=3, seed=42)
 
+        # Monta o cluster_names_map e display_names como o pipeline real
+        raw_cluster_ids = cluster_names
+        cluster_names_map, cluster_stats = determine_cluster_names_and_purity(
+            self.ids, self.metadatas, raw_cluster_ids
+        )
+        unique_cids = sorted(list(set(raw_cluster_ids)), key=lambda x: (x == "ruido", x))
+        display_names = [cluster_names_map.get(cid, cid) for cid in unique_cids]
+
         model_payload = {
             "algorithm": "kmeans",
             "centroids": kmeans.cluster_centers_,
-            "cluster_names": ["cluster_01", "cluster_02", "cluster_03"],
+            "cluster_names": unique_cids,
+            "cluster_display_names": display_names,
+            "cluster_names_map": cluster_names_map,
             "pca_model": pca_model,
             "seed": 42
         }
 
         # Testa atribuição incremental para um novo ponto próximo ao primeiro cluster
         new_sample = self.X[0] + np.random.normal(0, 0.05, size=self.X.shape[1])
-        assigned_cluster = assign_cluster_incremental(new_sample, model_payload)
+        result = assign_cluster_incremental(new_sample, model_payload)
 
-        self.assertIn(assigned_cluster, ["cluster_01", "cluster_02", "cluster_03"])
+        # Resultado é tupla (cluster_id, cluster_nome)
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+
+        assigned_cid, assigned_cnome = result
+        self.assertIn(assigned_cid, unique_cids)
         # Deve receber o mesmo cluster da amostra próxima
-        self.assertEqual(assigned_cluster, cluster_names[0])
+        self.assertEqual(assigned_cid, cluster_names[0])
+        # O nome de gênero deve corresponder ao mapeamento
+        self.assertEqual(assigned_cnome, cluster_names_map.get(assigned_cid, assigned_cid))
 
     def test_hdbscan_noise_and_summary(self):
         norm_X, _ = preprocess_embeddings(self.X)
-        hdb, labels, cluster_names = run_hdbscan(norm_X, min_cluster_size=10)
+        hdb, labels, raw_cluster_ids = run_hdbscan(norm_X, min_cluster_size=10)
+
+        cluster_names_map, cluster_stats = determine_cluster_names_and_purity(
+            self.ids, self.metadatas, raw_cluster_ids
+        )
 
         summary = compute_clusters_summary(
             ids=self.ids,
             metadatas=self.metadatas,
             processed_embeddings=norm_X,
             labels=labels,
-            cluster_names=cluster_names,
+            cluster_ids=raw_cluster_ids,
+            cluster_names_map=cluster_names_map,
+            cluster_stats=cluster_stats,
             algorithm="hdbscan"
         )
 
@@ -122,6 +148,8 @@ class TestClustering(unittest.TestCase):
             else:
                 self.assertIsNotNone(c_data["medoid"])
                 self.assertIn("track_id", c_data["medoid"])
+                # Verifica que o nome do cluster está preenchido
+                self.assertTrue(len(c_data.get("nome", "")) > 0)
 
     def test_metadata_preservation_logic(self):
         # Simula teste de integridade de metadados
@@ -132,14 +160,78 @@ class TestClustering(unittest.TestCase):
             "fingerprint": "abc123hash"
         }
         new_cluster = "cluster_05"
+        new_cluster_nome = "Rock"
 
         merged = dict(current_meta)
         merged["cluster_id"] = new_cluster
+        merged["cluster_nome"] = new_cluster_nome
 
         # Garante que nenhum campo anterior foi corrompido ou apagado
         for key, val in current_meta.items():
             self.assertEqual(merged[key], val)
         self.assertEqual(merged["cluster_id"], new_cluster)
+        self.assertEqual(merged["cluster_nome"], new_cluster_nome)
+
+    def test_cluster_naming_by_genre(self):
+        """Testa a nomenclatura de clusters por gênero predominante (voto majoritário)."""
+        # 3 clusters: 0 = todo Rock, 1 = misto Pop/Eletrônica, 2 = todo Sertanejo
+        ids = [f"id_{i}" for i in range(9)]
+        metadatas = [
+            {"subgenero": "Rock"}, {"subgenero": "Rock"}, {"subgenero": "Rock"},
+            {"subgenero": "Pop"}, {"subgenero": "Eletrônica"}, {"subgenero": "Pop"},
+            {"subgenero": "Sertanejo"}, {"subgenero": "Sertanejo"}, {"subgenero": "Sertanejo"},
+        ]
+        raw_cluster_ids = [
+            "cluster_01", "cluster_01", "cluster_01",
+            "cluster_02", "cluster_02", "cluster_02",
+            "cluster_03", "cluster_03", "cluster_03",
+        ]
+        names_map, stats = determine_cluster_names_and_purity(ids, metadatas, raw_cluster_ids)
+
+        # cluster_01 = 100% Rock → nome "Rock"
+        self.assertEqual(names_map["cluster_01"], "Rock")
+        self.assertAlmostEqual(stats["cluster_01"]["pureza"], 1.0)
+
+        # cluster_02 = Pop 66%, Eletrônica 33% → nome "Pop" (> 50%)
+        self.assertEqual(names_map["cluster_02"], "Pop")
+
+        # cluster_03 = 100% Sertanejo → nome "Sertanejo"
+        self.assertEqual(names_map["cluster_03"], "Sertanejo")
+
+    def test_cluster_naming_conflict_resolution(self):
+        """Testa desambiguação quando dois clusters têm o mesmo gênero predominante."""
+        ids = [f"id_{i}" for i in range(6)]
+        metadatas = [
+            {"subgenero": "Rock"}, {"subgenero": "Rock"}, {"subgenero": "Blues"},
+            {"subgenero": "Rock"}, {"subgenero": "Rock"}, {"subgenero": "Pop"},
+        ]
+        raw_cluster_ids = [
+            "cluster_01", "cluster_01", "cluster_01",
+            "cluster_02", "cluster_02", "cluster_02",
+        ]
+        names_map, stats = determine_cluster_names_and_purity(ids, metadatas, raw_cluster_ids)
+
+        # Ambos são majoritariamente Rock, devem ser diferenciados por g2
+        self.assertNotEqual(names_map["cluster_01"], names_map["cluster_02"])
+        # Um deve ser "Rock / Blues" e outro "Rock / Pop"
+        self.assertIn("Rock", names_map["cluster_01"])
+        self.assertIn("Rock", names_map["cluster_02"])
+
+    def test_cluster_naming_no_genre(self):
+        """Testa clusters onde nenhuma faixa tem subgênero preenchido."""
+        ids = ["id_0", "id_1"]
+        metadatas = [{"subgenero": ""}, {"subgenero": ""}]
+        raw_cluster_ids = ["cluster_01", "cluster_01"]
+        names_map, stats = determine_cluster_names_and_purity(ids, metadatas, raw_cluster_ids)
+
+        self.assertIn("Sem gênero", names_map["cluster_01"])
+
+    def test_sanitize_playlist_name(self):
+        """Testa sanitização de nomes com caracteres proibidos do Windows."""
+        self.assertEqual(sanitize_playlist_name("Rock / Blues"), "Rock - Blues")
+        self.assertEqual(sanitize_playlist_name('Pop "Remix"'), "Pop - Remix -")
+        self.assertNotEqual(sanitize_playlist_name("Eletrônica"), "")
+        self.assertEqual(sanitize_playlist_name(""), "Cluster")
 
 
 if __name__ == "__main__":

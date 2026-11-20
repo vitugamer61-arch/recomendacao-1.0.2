@@ -9,8 +9,55 @@ from typing import Dict, List
 
 from vector_store import get_client, get_or_create_collection, query_similar
 
-from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.metrics import (
+    silhouette_score,
+    davies_bouldin_score,
+    calinski_harabasz_score,
+    adjusted_rand_score,
+    normalized_mutual_info_score,
+    confusion_matrix
+)
 from sklearn.cluster import KMeans
+
+def evaluate_clustering_validation_metrics(ground_truth_labels: list, cluster_labels: list) -> dict:
+    """
+    Calcula métricas de validação externa/supervisionada comparando os clusters com os subgêneros:
+    - Pureza Média (Purity): [0, 1], fração de amostras atribuídas corretamente à classe majoritária do cluster.
+    - Adjusted Rand Index (ARI): [-1, 1], similaridade entre dois agrupamentos ajustada para o acaso.
+    - Normalized Mutual Information (NMI): [0, 1], concordância de informação mútua normalizada.
+    
+    Amostras sem subgênero preenchido (ou 'desconhecido'/'ruido') são desconsideradas no cálculo.
+    """
+    valid_gt = []
+    valid_pred = []
+    
+    for gt, pred in zip(ground_truth_labels, cluster_labels):
+        gt_str = str(gt).strip() if gt is not None else ""
+        pred_str = str(pred).strip() if pred is not None else ""
+        if gt_str and gt_str.lower() not in ["", "desconhecido", "none"] and pred_str.lower() != "ruido":
+            valid_gt.append(gt_str)
+            valid_pred.append(pred_str)
+            
+    if not valid_gt or len(set(valid_gt)) < 2 or len(set(valid_pred)) < 2:
+        return {
+            "purity": None,
+            "ari": None,
+            "nmi": None,
+            "valid_samples": len(valid_gt)
+        }
+        
+    cm = confusion_matrix(valid_gt, valid_pred)
+    purity = float(np.sum(np.amax(cm, axis=0)) / np.sum(cm))
+    ari = float(adjusted_rand_score(valid_gt, valid_pred))
+    nmi = float(normalized_mutual_info_score(valid_gt, valid_pred))
+    
+    return {
+        "purity": purity,
+        "ari": ari,
+        "nmi": nmi,
+        "valid_samples": len(valid_gt)
+    }
+
 
 def evaluate_clustering_metrics(embeddings: np.ndarray, labels: np.ndarray) -> dict:
     """

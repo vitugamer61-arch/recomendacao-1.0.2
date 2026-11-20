@@ -36,6 +36,10 @@ CLUSTER_MODEL_PATH = os.path.join(MODELS_DIR, "cluster_model.joblib")
 PLAYLISTS_DIR = os.path.join(BASE_DIR, "playlists")
 SESSION_HISTORY_FILE = os.path.join(BASE_DIR, "session_history.json")
 
+# Monitor de Precisão (Dashboard Streamlit)
+DASHBOARD_PATH = os.path.join(RESULTS_DIR, "dashboard.py")
+STREAMLIT_PORT = int(os.environ.get("STREAMLIT_PORT", 8501))
+
 
 def get_music_library_root(mpd_conf_path: str = None) -> str:
     """

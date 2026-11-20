@@ -7,8 +7,19 @@ A aplicação roda em segundo plano observando as alterações no estado do seu 
 
 ## Estrutura do Projeto
 - `audio_pipeline/`: Código principal em Python (indexação, embeddings e integração com MPD).
+- `docs/`: Documentação técnica detalhada da arquitetura, pipeline de áudio, identificação de faixas, recomendação, indexação e avaliação do TCC.
 - `mpd.conf.example`: Exemplo de configuração do servidor MPD no Windows.
 - `iniciar_sistema.bat`: Script prático para rodar tanto o servidor MPD quanto a IA integradora.
+
+## Documentação Técnica (TCC)
+Consulte a documentação completa em `docs/`:
+- [docs/arquitetura.md](docs/arquitetura.md): Fluxo geral do sistema (Cantata → MPD → ChromaDB) e responsabilidade de cada módulo.
+- [docs/pipeline_embeddings.md](docs/pipeline_embeddings.md): Ingestão, segmentação, modelo CLAP e pooling vetorial.
+- [docs/identificacao_faixas.md](docs/identificacao_faixas.md): Normalização de URLs do Cantata, mapeamento de arquivos e coexistência de IDs.
+- [docs/recomendacao_e_fila.md](docs/recomendacao_e_fila.md): Eventos do player, histórico de sessão, filtros de candidatas e reposição de fila.
+- [docs/indexacao.md](docs/indexacao.md): Comparação entre indexação em lote e indexação sob demanda (deduplicação por fingerprint).
+- [docs/avaliacao.md](docs/avaliacao.md): Métrica Precision@K, baseline aleatória e formulação matemática.
+- [docs/limitacoes.md](docs/limitacoes.md): Registro explícito de limitações conhecidas e inconsistências arquiteturais.
 
 ## Instalação e Uso
 

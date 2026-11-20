@@ -119,22 +119,32 @@ def index_unknown_track(filepath: str, metadata_path: str, collection, known_fin
 
     # Atribuição incremental de cluster se modelo K-Means existir
     assigned_cluster = None
+    assigned_nome = None
     try:
         from pathlib import Path
         import clustering
         model_path = Path(__file__).parent / "models" / "cluster_model.joblib"
         cluster_model = clustering.load_cluster_model(model_path)
         if cluster_model:
-            assigned_cluster = clustering.assign_cluster_incremental(np.array(embedding), cluster_model)
-            if assigned_cluster:
-                result["cluster_id"] = assigned_cluster
-                logger.info(f"Faixa atribuída incrementalmente ao {assigned_cluster}.")
+            assign_res = clustering.assign_cluster_incremental(np.array(embedding), cluster_model)
+            if assign_res:
+                if isinstance(assign_res, tuple):
+                    c_id, c_nome = assign_res
+                else:
+                    c_id = assign_res
+                    c_nome = c_id
+                result["cluster_id"] = c_id
+                result["cluster_nome"] = c_nome
+                assigned_cluster = c_id
+                assigned_nome = c_nome
+                logger.info(f"Faixa atribuída incrementalmente ao cluster '{c_nome}' ({c_id}).")
     except Exception as e:
         logger.warning(f"Não foi possível atribuir cluster incrementalmente: {e}")
 
     meta_to_insert = {"filename": filename, "subgenero": subgenero}
     if assigned_cluster:
         meta_to_insert["cluster_id"] = assigned_cluster
+        meta_to_insert["cluster_nome"] = assigned_nome
     
     # Inserir no ChromaDB usando upsert
     try:

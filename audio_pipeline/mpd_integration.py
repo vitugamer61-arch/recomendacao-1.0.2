@@ -259,6 +259,7 @@ def select_next_recommendations(
     query_emb = np.array(result['embeddings'][0])
     current_meta = result.get('metadatas', [{}])[0] if result.get('metadatas') else {}
     current_cluster = current_meta.get('cluster_id') if current_meta else None
+    current_cluster_nome = current_meta.get('cluster_nome') if current_meta else None
 
     similares = []
 
@@ -295,7 +296,8 @@ def select_next_recommendations(
             cluster_candidates.sort(key=lambda x: x["distance"])
             similares = cluster_candidates[:k]
             if similares and msg_queue:
-                msg_queue.put({"type": "log", "text": f"Modo Cluster ativo: {current_cluster} ({len(similares)} candidatas)"})
+                display_name = current_cluster_nome or current_cluster
+                msg_queue.put({"type": "log", "text": f"Modo Cluster ativo: {display_name} ({current_cluster}) ({len(similares)} candidatas)"})
         except Exception as e:
             logging.warning(f"Erro ao consultar faixas do mesmo cluster '{current_cluster}': {e}. Usando fallback K-NN.")
 
