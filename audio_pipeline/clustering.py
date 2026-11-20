@@ -569,11 +569,16 @@ def generate_2d_visualization(
     embeddings: np.ndarray,
     cluster_names: List[str],
     output_png_path: Path,
-    seed: int = 42
+    seed: int = 42,
+    ids: Optional[List[str]] = None,
+    metadatas: Optional[List[Dict[str, Any]]] = None,
+    raw_cluster_ids: Optional[List[str]] = None,
+    csv_output_path: Optional[Path] = None
 ) -> str:
     """
     Gera projeção 2D das músicas colorida por cluster.
     Tenta utilizar UMAP; se indisponível, utiliza t-SNE como fallback.
+    Salva imagem PNG e, se configurado, arquivo CSV com coordenadas 2D.
     """
     output_png_path.parent.mkdir(parents=True, exist_ok=True)
     method_name = "t-SNE"
@@ -592,6 +597,27 @@ def generate_2d_visualization(
         tsne = TSNE(n_components=2, random_state=seed, perplexity=perplexity_val, n_iter_without_progress=300)
         coords = tsne.fit_transform(embeddings)
         method_name = "t-SNE"
+
+    # Salva coordenadas 2D em CSV para o Dashboard Streamlit (sem recalcular projeção)
+    if csv_output_path is not None:
+        csv_output_path.parent.mkdir(parents=True, exist_ok=True)
+        rows_2d = []
+        for idx in range(len(embeddings)):
+            tid = ids[idx] if ids and idx < len(ids) else f"id_{idx}"
+            meta = metadatas[idx] if metadatas and idx < len(metadatas) else {}
+            cid = raw_cluster_ids[idx] if raw_cluster_ids and idx < len(raw_cluster_ids) else "cluster_01"
+            cname = cluster_names[idx] if idx < len(cluster_names) else cid
+            rows_2d.append({
+                "track_id": tid,
+                "filename": meta.get("filename", ""),
+                "subgenero": meta.get("subgenero", ""),
+                "cluster_id": cid,
+                "cluster_nome": cname,
+                "x": float(np.round(coords[idx, 0], 4)),
+                "y": float(np.round(coords[idx, 1], 4))
+            })
+        pd.DataFrame(rows_2d).to_csv(csv_output_path, index=False, encoding="utf-8")
+        logger.info(f"Coordenadas 2D ({method_name}) salvas com sucesso em: {csv_output_path}")
 
     fig, ax = plt.subplots(figsize=(12, 8), dpi=300)
 
@@ -895,10 +921,20 @@ def run_clustering_pipeline(
         metadata_json_path=metadata_json_path
     )
 
-    # 8. Visualização 2D
-    if generate_graph:
+    # 8. Visualização 2D e Exportação de Coordenadas para o Dashboard
+    csv_2d_path = results_dir / "clusters_2d.csv"
+    if generate_graph or not csv_2d_path.exists():
         graph_png_path = results_dir / "clusters_visualization.png"
-        generate_2d_visualization(processed_embs, cluster_display_names, graph_png_path, seed=seed)
+        generate_2d_visualization(
+            embeddings=processed_embs,
+            cluster_names=cluster_display_names,
+            output_png_path=graph_png_path,
+            seed=seed,
+            ids=ids,
+            metadatas=metadatas,
+            raw_cluster_ids=raw_cluster_ids,
+            csv_output_path=csv_2d_path
+        )
 
     # 9. Exportar Playlists para MPD
     if export_playlists:

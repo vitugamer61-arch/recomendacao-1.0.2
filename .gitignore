@@ -21,6 +21,7 @@ mpd/music/
 
 # Bancos de dados e saidas geradas
 audio_pipeline/results/
+!audio_pipeline/results/*.py
 audio_pipeline/output/
 audio_pipeline/log/
 audio_pipeline/chroma_db/
