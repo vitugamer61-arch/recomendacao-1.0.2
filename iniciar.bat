@@ -12,6 +12,7 @@ REM   6. Mantem o recomendador ativo em primeiro plano (Modo: cluster)
 REM
 REM Flags opcionais (passar como argumentos):
 REM   --recalcular     Refaz a clusterizacao do zero
+REM   --modo <modo>    Modo de clusterizacao: refinado (padrao), nao-supervisionado, por-genero
 REM   --sem-cluster    Inicia somente o recomendador K-NN classico
 REM   --sem-monitor    Nao inicia o Monitor de Precisao (Streamlit)
 REM   --pasta <caminho> Define o caminho da pasta de musicas

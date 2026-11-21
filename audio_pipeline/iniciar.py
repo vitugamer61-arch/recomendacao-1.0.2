@@ -184,11 +184,15 @@ def etapa_2_indexacao(music_root: Path, collection) -> bool:
 def etapa_3_clusterizacao(
     novas_faixas: bool,
     recalcular: bool,
+    modo: str = "refinado",
+    pureza_minima: float = 0.80,
+    tamanho_minimo: int = 15,
+    profundidade_maxima: int = 3,
     seed: int = 42
 ) -> None:
     """
     Etapa 3: Gerencia a clusterização.
-    - Se recalcular ou modelo ausente: roda clusterização completa K-Means.
+    - Se recalcular ou modelo ausente: roda clusterização completa K-Means no modo escolhido.
     - Se modelo já existe e novas faixas: os clusters já foram atribuídos incrementalmente.
     - Se já calibrado e sem novas faixas: reaproveita sem recalcular.
     """
@@ -201,19 +205,23 @@ def etapa_3_clusterizacao(
 
     if deve_recalcular:
         motivo = "Solicitação explícita (--recalcular)" if recalcular else "Modelo não encontrado"
-        logger.info(f"[3/6] Executando clusterização completa ({motivo})...")
+        logger.info(f"[3/6] Executando clusterização completa ({motivo}) no modo '{modo}'...")
         res = clustering.run_clustering_pipeline(
             k_arg="auto",
             k_min=4,
             k_max=30,
             algorithm="kmeans",
+            modo=modo,
+            pureza_minima=pureza_minima,
+            tamanho_minimo=tamanho_minimo,
+            profundidade_maxima=profundidade_maxima,
             seed=seed,
             export_playlists=False,
             generate_graph=True,
             recalculate=True,
             skip_backup=False
         )
-        logger.info(f"[3/6] [OK] Clusterização finalizada com sucesso: {res['n_clusters']} clusters calibrados.")
+        logger.info(f"[3/6] [OK] Clusterização finalizada com sucesso: {res['n_clusters']} clusters calibrados (Modo: '{modo}').")
     else:
         if novas_faixas:
             logger.info("[3/6] [OK] Novas faixas atribuídas incrementalmente aos clusters existentes.")
@@ -270,6 +278,10 @@ def main():
     parser = argparse.ArgumentParser(description="Ponto de entrada único do Sistema de Recomendação Musical")
     parser.add_argument("--pasta", type=str, default=None, help="Caminho absoluto da pasta de músicas (Google Drive / local)")
     parser.add_argument("--recalcular", action="store_true", help="Força recálculo completo da clusterização K-Means do zero")
+    parser.add_argument("--modo", type=str, choices=["refinado", "nao-supervisionado", "por-genero"], default="refinado", help="Modo de clusterização: refinado (padrão), nao-supervisionado, por-genero")
+    parser.add_argument("--pureza-minima", type=float, default=0.80, help="Pureza mínima para parada de refinamento (padrão: 0.80)")
+    parser.add_argument("--tamanho-minimo", type=int, default=15, help="Tamanho mínimo de cluster para refinamento (padrão: 15)")
+    parser.add_argument("--profundidade-maxima", type=int, default=3, help="Profundidade máxima de refinamento recursivo (padrão: 3)")
     parser.add_argument("--sem-cluster", action="store_true", help="Inicia o recomendador no modo clássico de similaridade K-NN (sem priorizar cluster)")
     parser.add_argument("--no-gui", action="store_true", help="Executa o recomendador no console sem abrir janela gráfica Tkinter")
     parser.add_argument("--sem-monitor", action="store_true", help="Inicia sem o Monitor de Precisão (Dashboard Streamlit)")
@@ -314,6 +326,10 @@ def main():
         etapa_3_clusterizacao(
             novas_faixas=novas_faixas,
             recalcular=args.recalcular,
+            modo=args.modo,
+            pureza_minima=args.pureza_minima,
+            tamanho_minimo=args.tamanho_minimo,
+            profundidade_maxima=args.profundidade_maxima,
             seed=args.seed
         )
 

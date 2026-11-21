@@ -21,7 +21,9 @@ from clustering import (
     compute_clusters_summary,
     assign_cluster_incremental,
     determine_cluster_names_and_purity,
-    sanitize_playlist_name
+    sanitize_playlist_name,
+    refine_impure_clusters,
+    run_by_genre_mode
 )
 
 class TestClustering(unittest.TestCase):
@@ -232,6 +234,76 @@ class TestClustering(unittest.TestCase):
         self.assertEqual(sanitize_playlist_name('Pop "Remix"'), "Pop - Remix -")
         self.assertNotEqual(sanitize_playlist_name("Eletrônica"), "")
         self.assertEqual(sanitize_playlist_name(""), "Cluster")
+
+    def test_cluster_naming_numeric_suffix_no_compound_names(self):
+        """Testa que não são gerados nomes compostos com barra e repetições usam sufixo numérico."""
+        ids = [f"id_{i}" for i in range(4)]
+        metadatas = [
+            {"subgenero": "Rock"},
+            {"subgenero": "Rock"},
+            {"subgenero": "Rock"},
+            {"subgenero": "Rock"},
+        ]
+        raw_cluster_ids = ["cluster_01", "cluster_01", "cluster_02", "cluster_02"]
+        names_map, stats = determine_cluster_names_and_purity(ids, metadatas, raw_cluster_ids)
+
+        self.assertEqual(names_map["cluster_01"], "Rock 1")
+        self.assertEqual(names_map["cluster_02"], "Rock 2")
+        self.assertNotIn("/", names_map["cluster_01"])
+        self.assertNotIn("/", names_map["cluster_02"])
+
+    def test_refine_impure_clusters_splits_mixed(self):
+        """Testa se o refinamento recursivo divide um cluster impuro com dois gêneros distintos."""
+        # Cria dois blobs separados no mesmo cluster inicial
+        X_sub1, _ = make_blobs(n_samples=25, n_features=16, centers=[[2.0]*16], cluster_std=0.2, random_state=42)
+        X_sub2, _ = make_blobs(n_samples=25, n_features=16, centers=[[-2.0]*16], cluster_std=0.2, random_state=42)
+        X_mixed = np.vstack([X_sub1, X_sub2])
+        X_norm = normalize(X_mixed, norm="l2")
+
+        ids = [f"mix_{i}" for i in range(50)]
+        metadatas = [{"subgenero": "Rock"} for _ in range(25)] + [{"subgenero": "MPB"} for _ in range(25)]
+        raw_cluster_ids = ["cluster_01"] * 50
+
+        refined_ids, centroids, unique_finals = refine_impure_clusters(
+            embeddings=X_norm,
+            raw_cluster_ids=raw_cluster_ids,
+            ids=ids,
+            metadatas=metadatas,
+            seed=42,
+            pureza_minima=0.80,
+            tamanho_minimo=15,
+            profundidade_maxima=2
+        )
+
+        # O cluster impuro de 50 faixas deve ter sido dividido
+        self.assertGreater(len(unique_finals), 1)
+        names_map, stats = determine_cluster_names_and_purity(ids, metadatas, refined_ids)
+        # Nomes devem conter os gêneros (Rock e MPB) separados
+        g_names = list(names_map.values())
+        self.assertTrue(any("Rock" in n for n in g_names))
+        self.assertTrue(any("MPB" in n for n in g_names))
+
+    def test_by_genre_mode(self):
+        """Testa a geração de sub-clusters pelo modo por-genero."""
+        X_blob, _ = make_blobs(n_samples=40, n_features=16, centers=2, cluster_std=0.3, random_state=42)
+        X_norm = normalize(X_blob, norm="l2")
+
+        ids = [f"pg_{i}" for i in range(40)]
+        metadatas = [{"subgenero": "Rock"} for _ in range(40)]
+
+        c_ids, centroids, unique_cids = run_by_genre_mode(
+            embeddings=X_norm,
+            ids=ids,
+            metadatas=metadatas,
+            seed=42,
+            tamanho_minimo=15
+        )
+
+        self.assertEqual(len(c_ids), 40)
+        self.assertGreaterEqual(len(unique_cids), 1)
+        names_map, _ = determine_cluster_names_and_purity(ids, metadatas, c_ids)
+        for c_nome in names_map.values():
+            self.assertIn("Rock", c_nome)
 
 
 if __name__ == "__main__":

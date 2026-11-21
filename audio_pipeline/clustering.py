@@ -5,6 +5,8 @@ Funcionalidades:
 - Carregamento de embeddings agregados e metadados direto do ChromaDB.
 - Normalização L2 e redução opcional de dimensionalidade com PCA (salvo para inferência incremental).
 - Agrupamento via K-Means com seleção automática do melhor k (via Coeficiente de Silhueta) ou HDBSCAN.
+- Refinamento recursivo de clusters impuros (pureza < limiar configurável).
+- Três modos de operação: nao-supervisionado, refinado (padrão) e por-genero.
 - Persistência segura no ChromaDB (com backup prévio e validação estrita de metadados).
 - Geração de clusters.json com estatísticas e medoides de cada cluster.
 - Visualização 2D (UMAP ou t-SNE) e gráficos de avaliação para o TCC.
@@ -55,6 +57,17 @@ logger = logging.getLogger("clustering")
 DEFAULT_RESULTS_DIR = _SCRIPT_DIR / "results"
 DEFAULT_MODELS_DIR = _SCRIPT_DIR / "models"
 MODEL_FILE_NAME = "cluster_model.joblib"
+
+# Modos de clusterização
+MODO_NAO_SUPERVISIONADO = "nao-supervisionado"
+MODO_REFINADO = "refinado"
+MODO_POR_GENERO = "por-genero"
+MODOS_VALIDOS = [MODO_NAO_SUPERVISIONADO, MODO_REFINADO, MODO_POR_GENERO]
+
+# Parâmetros padrão do refinamento recursivo
+DEFAULT_PUREZA_MINIMA = 0.80
+DEFAULT_TAMANHO_MINIMO = 15
+DEFAULT_PROFUNDIDADE_MAXIMA = 3
 
 
 # ── CARREGAMENTO DE DADOS DO CHROMADB ─────────────────────────────────────────
@@ -188,11 +201,14 @@ def determine_cluster_names_and_purity(
     Determina o nome de cada cluster a partir do subgênero predominante (voto majoritário)
     das faixas do cluster e calcula a pureza e distribuição de gêneros.
 
-    Regras:
-      a) Se dois clusters tiverem o mesmo gênero predominante, diferenciar pelo segundo
-         gênero mais frequente (ex: 'Rock / Blues') ou por sufixo numérico ('Rock 1', 'Rock 2').
-      b) Se nenhum gênero passar de ~50% do cluster, nomear com os dois mais frequentes (ex.: 'Pop / Eletrônica').
-      c) Faixas sem subgênero não entram na votação; se o cluster inteiro não tiver gênero, usar 'Sem gênero N'.
+    Regras de nomeação:
+      a) Cada cluster recebe o nome do seu gênero predominante.
+      b) Se múltiplos clusters tiverem o mesmo gênero predominante, diferenciar por
+         sufixo numérico ("Rock 1", "Rock 2", ...).
+      c) Não são gerados nomes compostos (ex.: "Rock / MPB"). A mistura residual fica
+         registrada em clusters.json (pureza e distribuição de gêneros).
+      d) Faixas sem subgênero não entram na votação; se o cluster não tiver faixas com
+         gênero válido, usar 'Sem gênero' (ou 'Sem gênero 1', 'Sem gênero 2' se houver conflito).
     """
     unique_ids = sorted(list(set(raw_cluster_ids)), key=lambda x: (x == "ruido", x))
     cluster_stats: Dict[str, Dict[str, Any]] = {}
@@ -236,11 +252,8 @@ def determine_cluster_names_and_purity(
             pct1 = count1 / total
             g2 = most_common[1][0] if len(most_common) > 1 else None
 
-            # Regra b: se nenhum gênero passar de 50%, usar os dois mais frequentes
-            if pct1 >= 0.50 or g2 is None:
-                nome_base = g1
-            else:
-                nome_base = f"{g1} / {g2}"
+            # Cada cluster usa o gênero predominante direto (sem nomes compostos)
+            nome_base = g1
 
             cluster_stats[cid] = {
                 "nome_provisorio": nome_base,
@@ -252,7 +265,7 @@ def determine_cluster_names_and_purity(
                 "pct1": pct1
             }
 
-    # 2. Resolução de conflitos de nomes (Regras a e c)
+    # 2. Resolução de conflitos de nomes (sufixo numérico para repetições)
     by_name = defaultdict(list)
     for cid, st in cluster_stats.items():
         if cid == "ruido":
@@ -267,28 +280,264 @@ def determine_cluster_names_and_purity(
         if len(cids) == 1:
             final_names[cids[0]] = name_base
         else:
-            # Caso 1: tentar diferenciar pelo segundo gênero mais frequente (g2)
-            tentativa_g2 = {}
-            for cid in cids:
-                st = cluster_stats[cid]
-                if st["g1"] and st["g2"] and "/" not in name_base:
-                    tentativa_g2[cid] = f"{st['g1']} / {st['g2']}"
-                else:
-                    tentativa_g2[cid] = name_base
-
-            # Verifica se os nomes ficaram únicos com g2
-            if len(set(tentativa_g2.values())) == len(cids):
-                for cid in cids:
-                    final_names[cid] = tentativa_g2[cid]
-            else:
-                # Caso 2: sufixo numérico (ex: "Rock 1", "Rock 2" ou "Sem gênero 1", "Sem gênero 2")
-                for idx, cid in enumerate(cids, 1):
-                    final_names[cid] = f"{name_base} {idx}"
+            # Sufixo numérico: "Rock 1", "Rock 2", ...
+            for idx, cid in enumerate(cids, 1):
+                final_names[cid] = f"{name_base} {idx}"
 
     for cid in unique_ids:
         cluster_stats[cid]["nome"] = final_names[cid]
 
     return final_names, cluster_stats
+
+
+# ── REFINAMENTO RECURSIVO DE CLUSTERS IMPUROS ─────────────────────────────────
+
+def _extract_cluster_genres(metadatas_subset: List[Dict[str, Any]]) -> List[str]:
+    """Extrai os subgêneros válidos de um subconjunto de metadatas."""
+    generos = [
+        str(m.get("subgenero", "")).strip()
+        for m in metadatas_subset
+    ]
+    return [g for g in generos if g and g.lower() not in ["", "desconhecido", "none"]]
+
+
+def _compute_subset_purity_and_second_ratio(metadatas_subset: List[Dict[str, Any]]) -> Tuple[float, float, str]:
+    """Calcula pureza, proporção do segundo gênero e gênero predominante."""
+    valid_genres = _extract_cluster_genres(metadatas_subset)
+    if not valid_genres:
+        return 1.0, 0.0, "Sem gênero"
+    counter = Counter(valid_genres)
+    total = len(valid_genres)
+    most_common = counter.most_common()
+    g1, count1 = most_common[0]
+    p1 = count1 / total
+    p2 = (most_common[1][1] / total) if len(most_common) > 1 else 0.0
+    return p1, p2, g1
+
+
+def refine_impure_clusters(
+    embeddings: np.ndarray,
+    raw_cluster_ids: List[str],
+    ids: List[str],
+    metadatas: List[Dict[str, Any]],
+    seed: int = 42,
+    pureza_minima: float = DEFAULT_PUREZA_MINIMA,
+    tamanho_minimo: int = DEFAULT_TAMANHO_MINIMO,
+    profundidade_maxima: int = DEFAULT_PROFUNDIDADE_MAXIMA
+) -> Tuple[List[str], np.ndarray, List[str]]:
+    """
+    Após o K-Means inicial, divide recursivamente cada cluster impuro
+    (pureza < 80% ou segundo gênero > 20%) com K-Means k=2..4 sobre os embeddings daquele cluster,
+    escolhendo o k que mais aumenta a pureza.
+    Para quando:
+      - Pureza >= pureza_minima E segundo gênero <= 20%
+      - Menos de tamanho_minimo faixas
+      - A divisão não melhorar a pureza
+      - Profundidade máxima atingida
+
+    Retorna:
+      (final_cluster_ids, centroids_array, unique_cluster_ids)
+    """
+    logger.info(
+        f"Iniciando refinamento recursivo (pureza_min={pureza_minima:.0%}, "
+        f"tamanho_min={tamanho_minimo}, prof_max={profundidade_maxima})..."
+    )
+
+    current_assignment = list(raw_cluster_ids)
+    next_sub_id = 1
+
+    def _refine_subgroup(indices: List[int], depth: int) -> Dict[int, str]:
+        nonlocal next_sub_id
+        if len(indices) < tamanho_minimo or depth >= profundidade_maxima:
+            sub_id = f"c_{next_sub_id:03d}"
+            next_sub_id += 1
+            return {i: sub_id for i in indices}
+
+        sub_metas = [metadatas[i] for i in indices]
+        p1, p2, g1 = _compute_subset_purity_and_second_ratio(sub_metas)
+
+        # Critério de parada: já é suficientemente puro
+        if p1 >= pureza_minima and p2 <= 0.20:
+            sub_id = f"c_{next_sub_id:03d}"
+            next_sub_id += 1
+            return {i: sub_id for i in indices}
+
+        sub_embs = embeddings[indices]
+        best_k = None
+        best_split_labels = None
+        best_purity = p1
+
+        for k_try in range(2, 5):
+            if k_try >= len(indices):
+                break
+            km = KMeans(n_clusters=k_try, random_state=seed + depth * 10 + k_try, n_init=10)
+            trial_labels = km.fit_predict(sub_embs)
+
+            # Pureza ponderada após divisão
+            weighted_purity = 0.0
+            total_items = 0
+            for l_idx in range(k_try):
+                group_idx = [j for j, val in enumerate(trial_labels) if val == l_idx]
+                if not group_idx:
+                    continue
+                group_metas = [sub_metas[j] for j in group_idx]
+                gp1, _, _ = _compute_subset_purity_and_second_ratio(group_metas)
+                weighted_purity += gp1 * len(group_idx)
+                total_items += len(group_idx)
+
+            avg_trial_purity = (weighted_purity / total_items) if total_items > 0 else 0.0
+            if avg_trial_purity > best_purity + 0.005:  # melhora real
+                best_purity = avg_trial_purity
+                best_k = k_try
+                best_split_labels = trial_labels
+
+        # Se a divisão não melhorou a pureza, parar
+        if best_k is None or best_split_labels is None:
+            sub_id = f"c_{next_sub_id:03d}"
+            next_sub_id += 1
+            return {i: sub_id for i in indices}
+
+        logger.info(
+            f"  Subdividindo grupo de {len(indices)} faixas (predominante: '{g1}', pureza anterior: {p1:.1%}) "
+            f"em k={best_k} (nova pureza média: {best_purity:.1%}, prof={depth + 1})"
+        )
+
+        result_map: Dict[int, str] = {}
+        for l_idx in range(best_k):
+            sub_sub_indices = [indices[j] for j, val in enumerate(best_split_labels) if val == l_idx]
+            if sub_sub_indices:
+                sub_res = _refine_subgroup(sub_sub_indices, depth + 1)
+                result_map.update(sub_res)
+
+        return result_map
+
+    unique_initial = sorted(set(raw_cluster_ids), key=lambda x: (x == "ruido", x))
+    all_mapping: Dict[int, str] = {}
+
+    for cid in unique_initial:
+        indices = [i for i, c in enumerate(raw_cluster_ids) if c == cid]
+        if cid == "ruido":
+            for i in indices:
+                all_mapping[i] = "ruido"
+        else:
+            sub_res = _refine_subgroup(indices, depth=0)
+            all_mapping.update(sub_res)
+
+    # Renumerar os clusters de forma ordenada: cluster_01, cluster_02, ...
+    temp_cluster_ids = [all_mapping[i] for i in range(len(raw_cluster_ids))]
+    unique_temp = sorted(set(temp_cluster_ids), key=lambda x: (x == "ruido", x))
+
+    final_id_map: Dict[str, str] = {}
+    cluster_counter = 1
+    for ut in unique_temp:
+        if ut == "ruido":
+            final_id_map[ut] = "ruido"
+        else:
+            final_id_map[ut] = f"cluster_{cluster_counter:02d}"
+            cluster_counter += 1
+
+    final_cluster_ids = [final_id_map[cid] for cid in temp_cluster_ids]
+    unique_final = sorted(set(final_cluster_ids), key=lambda x: (x == "ruido", x))
+    non_noise_finals = [c for c in unique_final if c != "ruido"]
+
+    # Calcular centroides finais para cada cluster
+    centroids_list = []
+    for cid in non_noise_finals:
+        idx_c = [i for i, c in enumerate(final_cluster_ids) if c == cid]
+        c_mean = np.mean(embeddings[idx_c], axis=0)
+        c_norm = normalize(c_mean.reshape(1, -1), norm="l2")[0]
+        centroids_list.append(c_norm)
+
+    centroids_array = np.array(centroids_list, dtype=np.float32) if centroids_list else np.empty((0, embeddings.shape[1]))
+    logger.info(f"Refinamento concluído: {len(unique_initial)} clusters originais → {len(non_noise_finals)} clusters refinados.")
+    return final_cluster_ids, centroids_array, non_noise_finals
+
+
+def run_by_genre_mode(
+    embeddings: np.ndarray,
+    ids: List[str],
+    metadatas: List[Dict[str, Any]],
+    seed: int = 42,
+    tamanho_minimo: int = DEFAULT_TAMANHO_MINIMO
+) -> Tuple[List[str], np.ndarray, List[str]]:
+    """
+    Modo por-gênero: agrupa faixas separadamente dentro de cada subgênero,
+    gerando sub-clusters sonoros como 'Rock 1', 'Rock 2', 'Eletrônica 1', etc.
+    """
+    logger.info("Executando clusterização no modo 'por-genero' (sub-clusters por subgênero)...")
+
+    genre_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for i, meta in enumerate(metadatas):
+        genre = str(meta.get("subgenero", "")).strip()
+        if not genre or genre.lower() in ["desconhecido", "none"]:
+            genre = "Sem gênero"
+        genre_to_indices[genre].append(i)
+
+    cluster_assignments = [""] * len(ids)
+    all_centroids = []
+    cluster_counter = 1
+    unique_cluster_ids = []
+
+    from sklearn.metrics import silhouette_score
+
+    for genre in sorted(genre_to_indices.keys()):
+        indices = genre_to_indices[genre]
+        sub_embs = embeddings[indices]
+        n_tracks = len(indices)
+
+        if n_tracks < tamanho_minimo:
+            cid = f"cluster_{cluster_counter:02d}"
+            cluster_counter += 1
+            unique_cluster_ids.append(cid)
+            for i in indices:
+                cluster_assignments[i] = cid
+            c_mean = np.mean(sub_embs, axis=0)
+            all_centroids.append(normalize(c_mean.reshape(1, -1), norm="l2")[0])
+            logger.info(f"  Gênero '{genre}': {n_tracks} faixas → 1 cluster ({cid})")
+            continue
+
+        # Avaliar melhor k para sub-clusters sonoros
+        max_k = min(6, max(2, n_tracks // 15))
+        best_k = 1
+        best_sil = -1.0
+        best_labels = None
+
+        for k_try in range(2, max_k + 1):
+            if k_try >= n_tracks:
+                break
+            km = KMeans(n_clusters=k_try, random_state=seed, n_init=10)
+            labels = km.fit_predict(sub_embs)
+            if len(set(labels)) < 2:
+                continue
+            sil = float(silhouette_score(sub_embs, labels, metric="euclidean"))
+            if sil > best_sil:
+                best_sil = sil
+                best_k = k_try
+                best_labels = labels
+
+        if best_k == 1 or best_labels is None:
+            cid = f"cluster_{cluster_counter:02d}"
+            cluster_counter += 1
+            unique_cluster_ids.append(cid)
+            for i in indices:
+                cluster_assignments[i] = cid
+            c_mean = np.mean(sub_embs, axis=0)
+            all_centroids.append(normalize(c_mean.reshape(1, -1), norm="l2")[0])
+            logger.info(f"  Gênero '{genre}': {n_tracks} faixas → 1 cluster ({cid})")
+        else:
+            logger.info(f"  Gênero '{genre}': {n_tracks} faixas → {best_k} sub-clusters sonoros (silhueta interna: {best_sil:.4f})")
+            for sub_l in range(best_k):
+                cid = f"cluster_{cluster_counter:02d}"
+                cluster_counter += 1
+                unique_cluster_ids.append(cid)
+                sub_sub_idx = [indices[j] for j, val in enumerate(best_labels) if val == sub_l]
+                for i in sub_sub_idx:
+                    cluster_assignments[i] = cid
+                c_mean = np.mean(embeddings[sub_sub_idx], axis=0)
+                all_centroids.append(normalize(c_mean.reshape(1, -1), norm="l2")[0])
+
+    centroids_array = np.array(all_centroids, dtype=np.float32)
+    return cluster_assignments, centroids_array, unique_cluster_ids
 
 
 # ── MEDÓIDES E RESUMO DE CLUSTERS ─────────────────────────────────────────────
@@ -333,10 +582,16 @@ def compute_clusters_summary(
 
         medoid_info = None
         if cid != "ruido" and len(indices) > 0:
-            if algorithm == "kmeans" and centroids is not None:
-                c_idx = int(cid.split("_")[-1]) - 1
-                c_vec = centroids[c_idx]
-            else:
+            c_vec = None
+            if centroids is not None:
+                non_noise = [c for c in unique_cids if c != "ruido"]
+                if isinstance(centroids, dict) and cid in centroids:
+                    c_vec = centroids[cid]
+                elif isinstance(centroids, np.ndarray) and cid in non_noise:
+                    c_idx = non_noise.index(cid)
+                    if c_idx < len(centroids):
+                        c_vec = centroids[c_idx]
+            if c_vec is None:
                 c_vec = np.mean(cluster_embs, axis=0)
 
             dists = np.linalg.norm(cluster_embs - c_vec, axis=1)
@@ -755,11 +1010,52 @@ def export_playlists_to_mpd(
 
 # ── PIPELINE PRINCIPAL DE CLUSTERIZAÇÃO ────────────────────────────────────────
 
+def _evaluate_mode_metrics_dict(
+    modo: str,
+    algorithm: str,
+    embs: np.ndarray,
+    cluster_ids: List[str],
+    ids: List[str],
+    metadatas: List[Dict[str, Any]],
+    n_pca: Optional[int],
+    seed: int
+) -> Dict[str, Any]:
+    """Calcula a linha de métricas para inclusão comparativa no CSV de avaliação."""
+    c_names_map, _ = determine_cluster_names_and_purity(ids, metadatas, cluster_ids)
+    display_names = [c_names_map.get(cid, cid) for cid in cluster_ids]
+    unique_c = sorted(set(cluster_ids), key=lambda x: (x == "ruido", x))
+    labels = np.array([unique_c.index(c) if c != "ruido" else -1 for c in cluster_ids])
+
+    metrics = evaluate_clustering_metrics(embs, labels)
+    subg_gt = [m.get("subgenero") for m in metadatas]
+    val_m = evaluate_clustering_validation_metrics(subg_gt, display_names)
+
+    return {
+        "modo": modo,
+        "algorithm": algorithm,
+        "n_clusters": metrics["n_clusters"],
+        "silhouette": metrics["silhouette"],
+        "davies_bouldin": metrics["davies_bouldin"],
+        "calinski_harabasz": metrics["calinski_harabasz"],
+        "pureza_media": val_m.get("purity"),
+        "ari": val_m.get("ari"),
+        "nmi": val_m.get("nmi"),
+        "noise_count": metrics["noise_count"],
+        "noise_ratio": metrics["noise_ratio"],
+        "pca_components": n_pca if n_pca else "None",
+        "seed": seed
+    }
+
+
 def run_clustering_pipeline(
     k_arg: str = "auto",
     k_min: int = 4,
     k_max: int = 30,
     algorithm: str = "kmeans",
+    modo: str = MODO_REFINADO,
+    pureza_minima: float = DEFAULT_PUREZA_MINIMA,
+    tamanho_minimo: int = DEFAULT_TAMANHO_MINIMO,
+    profundidade_maxima: int = DEFAULT_PROFUNDIDADE_MAXIMA,
     n_pca: Optional[int] = None,
     seed: int = 42,
     export_playlists: bool = False,
@@ -773,6 +1069,9 @@ def run_clustering_pipeline(
     results_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     model_path = models_dir / MODEL_FILE_NAME
+
+    if modo not in MODOS_VALIDOS:
+        raise ValueError(f"Modo inválido: '{modo}'. Opções: {MODOS_VALIDOS}")
 
     # Conectar ao ChromaDB
     client = vector_store.get_client(config.CHROMA_PERSIST_DIR)
@@ -797,9 +1096,20 @@ def run_clustering_pipeline(
     chosen_k = None
     df_k_metrics = None
     centroids = None
-    model_obj = None
+    labels = None
+    raw_cluster_ids = None
 
-    if algorithm == "kmeans":
+    if algorithm == "hdbscan":
+        model_obj, labels, raw_cluster_ids = run_hdbscan(processed_embs, min_cluster_size=5)
+    elif modo == MODO_POR_GENERO:
+        # Modo por gênero direto
+        raw_cluster_ids, centroids, unique_cluster_ids = run_by_genre_mode(
+            processed_embs, ids, metadatas, seed=seed, tamanho_minimo=tamanho_minimo
+        )
+        labels = np.array([unique_cluster_ids.index(c) for c in raw_cluster_ids])
+        chosen_k = len(unique_cluster_ids)
+    else:
+        # K-Means inicial (busca k automático ou fixo)
         if k_arg.lower() == "auto":
             logger.info(f"Buscando melhor k entre {k_min} e {k_max} via Coeficiente de Silhueta...")
             df_k_metrics = evaluate_k_range(processed_embs, k_min=k_min, k_max=k_max, seed=seed)
@@ -822,13 +1132,25 @@ def run_clustering_pipeline(
             chosen_k = int(k_arg)
             logger.info(f"Usando k fixo configurado: {chosen_k}")
 
-        model_obj, labels, raw_cluster_ids = run_kmeans(processed_embs, k=chosen_k, seed=seed)
-        centroids = model_obj.cluster_centers_
+        km_initial, initial_labels, initial_cids = run_kmeans(processed_embs, k=chosen_k, seed=seed)
 
-    elif algorithm == "hdbscan":
-        model_obj, labels, raw_cluster_ids = run_hdbscan(processed_embs, min_cluster_size=5)
-    else:
-        raise ValueError(f"Algoritmo desconhecido: '{algorithm}'. Opções: 'kmeans', 'hdbscan'")
+        if modo == MODO_NAO_SUPERVISIONADO:
+            raw_cluster_ids = initial_cids
+            centroids = km_initial.cluster_centers_
+            labels = initial_labels
+        else:  # MODO_REFINADO (padrão)
+            raw_cluster_ids, centroids, unique_cids = refine_impure_clusters(
+                embeddings=processed_embs,
+                raw_cluster_ids=initial_cids,
+                ids=ids,
+                metadatas=metadatas,
+                seed=seed,
+                pureza_minima=pureza_minima,
+                tamanho_minimo=tamanho_minimo,
+                profundidade_maxima=profundidade_maxima
+            )
+            labels = np.array([unique_cids.index(c) for c in raw_cluster_ids])
+            chosen_k = len(unique_cids)
 
     # 4. Determinação dos nomes dos clusters por gênero musical e cálculo de pureza
     cluster_names_map, cluster_stats = determine_cluster_names_and_purity(ids, metadatas, raw_cluster_ids)
@@ -841,6 +1163,7 @@ def run_clustering_pipeline(
     # Avaliação das métricas intrínsecas
     metrics = evaluate_clustering_metrics(processed_embs, labels)
     logger.info("\n=== Métricas Finais de Agrupamento ===")
+    logger.info(f"Modo: {modo.upper()}")
     logger.info(f"Algoritmo: {algorithm.upper()}")
     logger.info(f"Clusters Formados: {metrics['n_clusters']}")
     if metrics["silhouette"] is not None:
@@ -862,8 +1185,11 @@ def run_clustering_pipeline(
         logger.info(f"  [{cid}] {st['nome']} - {tam} faixas (Pureza: {pct_pur:.1f}%, Gênero Predominante: {st.get('genero_predominante')})")
     logger.info("--------------------------------------------\n")
 
-    # Salva métricas finais em CSV para o TCC
-    final_metrics_df = pd.DataFrame([{
+    # ── Avaliação honesta para o TCC: Métricas comparativas dos 3 modos ───────
+    eval_rows = []
+    # Linha ativa (primeira linha do CSV para compatibilidade direta)
+    eval_rows.append({
+        "modo": modo,
         "algorithm": algorithm,
         "n_clusters": metrics["n_clusters"],
         "silhouette": metrics["silhouette"],
@@ -876,10 +1202,47 @@ def run_clustering_pipeline(
         "noise_ratio": metrics["noise_ratio"],
         "pca_components": n_pca if n_pca else "None",
         "seed": seed
-    }])
+    })
+
+    # Se algoritmo for kmeans e temos embeddings, computamos os outros modos para o TCC
+    if algorithm == "kmeans":
+        try:
+            logger.info("Computando métricas comparativas dos demais modos para o TCC...")
+            # 1. Modo nao-supervisionado se não foi o ativo
+            if modo != MODO_NAO_SUPERVISIONADO:
+                base_k = chosen_k if k_arg.lower() != "auto" else 4
+                _, _, ns_cids = run_kmeans(processed_embs, k=base_k, seed=seed)
+                eval_rows.append(_evaluate_mode_metrics_dict(
+                    MODO_NAO_SUPERVISIONADO, algorithm, processed_embs, ns_cids, ids, metadatas, n_pca, seed
+                ))
+
+            # 2. Modo refinado se não foi o ativo
+            if modo != MODO_REFINADO:
+                base_k = 4
+                _, _, init_cids = run_kmeans(processed_embs, k=base_k, seed=seed)
+                ref_cids, _, _ = refine_impure_clusters(
+                    processed_embs, init_cids, ids, metadatas, seed=seed,
+                    pureza_minima=pureza_minima, tamanho_minimo=tamanho_minimo, profundidade_maxima=profundidade_maxima
+                )
+                eval_rows.append(_evaluate_mode_metrics_dict(
+                    MODO_REFINADO, algorithm, processed_embs, ref_cids, ids, metadatas, n_pca, seed
+                ))
+
+            # 3. Modo por-genero se não foi o ativo
+            if modo != MODO_POR_GENERO:
+                pg_cids, _, _ = run_by_genre_mode(
+                    processed_embs, ids, metadatas, seed=seed, tamanho_minimo=tamanho_minimo
+                )
+                eval_rows.append(_evaluate_mode_metrics_dict(
+                    MODO_POR_GENERO, algorithm, processed_embs, pg_cids, ids, metadatas, n_pca, seed
+                ))
+        except Exception as e:
+            logger.warning(f"Erro ao computar comparativo de modos para o TCC: {e}")
+
+    final_metrics_df = pd.DataFrame(eval_rows)
     final_metrics_csv = results_dir / "clustering_evaluation.csv"
     save_clustering_metrics_csv(final_metrics_df, str(final_metrics_csv))
-    logger.info(f"Métricas finais exportadas para: {final_metrics_csv}")
+    logger.info(f"Métricas comparativas dos modos exportadas para: {final_metrics_csv}")
 
     # 5. Resumo e Medoides (clusters.json)
     summary = compute_clusters_summary(
@@ -890,10 +1253,11 @@ def run_clustering_pipeline(
         cluster_ids=raw_cluster_ids,
         cluster_names_map=cluster_names_map,
         cluster_stats=cluster_stats,
-        algorithm=algorithm,
+        algorithm=f"{algorithm}_{modo}",
         centroids=centroids,
         validation_metrics=val_metrics
     )
+    summary["modo"] = modo
     clusters_json_path = results_dir / "clusters.json"
     with open(clusters_json_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -901,11 +1265,23 @@ def run_clustering_pipeline(
 
     # 6. Salvar modelo para inferência incremental
     unique_cluster_ids = sorted(list(set(raw_cluster_ids)), key=lambda x: (x == "ruido", x))
+    non_noise_cids = [c for c in unique_cluster_ids if c != "ruido"]
+
+    # Assegura que centroids seja um ndarray correspondente aos non_noise_cids
+    if centroids is None or (isinstance(centroids, np.ndarray) and len(centroids) != len(non_noise_cids)):
+        c_list = []
+        for cid in non_noise_cids:
+            idx_c = [i for i, c in enumerate(raw_cluster_ids) if c == cid]
+            c_mean = np.mean(processed_embs[idx_c], axis=0)
+            c_norm = normalize(c_mean.reshape(1, -1), norm="l2")[0]
+            c_list.append(c_norm)
+        centroids = np.array(c_list, dtype=np.float32)
+
     save_cluster_model(
         output_path=model_path,
         algorithm=algorithm,
         centroids=centroids,
-        cluster_ids_unique=[c for c in unique_cluster_ids if c != "ruido"],
+        cluster_ids_unique=non_noise_cids,
         cluster_names_map=cluster_names_map,
         pca_model=pca_model,
         seed=seed
@@ -923,7 +1299,7 @@ def run_clustering_pipeline(
 
     # 8. Visualização 2D e Exportação de Coordenadas para o Dashboard
     csv_2d_path = results_dir / "clusters_2d.csv"
-    if generate_graph or not csv_2d_path.exists():
+    if generate_graph or not csv_2d_path.exists() or recalculate:
         graph_png_path = results_dir / "clusters_visualization.png"
         generate_2d_visualization(
             embeddings=processed_embs,
@@ -961,6 +1337,7 @@ def run_clustering_pipeline(
 
     return {
         "algorithm": algorithm,
+        "modo": modo,
         "n_clusters": metrics["n_clusters"],
         "chosen_k": chosen_k,
         "metrics": metrics,
@@ -977,6 +1354,10 @@ if __name__ == "__main__":
     parser.add_argument("--k-min", type=int, default=4, help="Valor mínimo de k para busca automática (padrão: 4)")
     parser.add_argument("--k-max", type=int, default=30, help="Valor máximo de k para busca automática (padrão: 30)")
     parser.add_argument("--algoritmo", type=str, choices=["kmeans", "hdbscan"], default="kmeans", help="Algoritmo de agrupamento (padrão: kmeans)")
+    parser.add_argument("--modo", type=str, choices=MODOS_VALIDOS, default=MODO_REFINADO, help="Modo de clusterização: refinado (padrão), nao-supervisionado, por-genero")
+    parser.add_argument("--pureza-minima", type=float, default=DEFAULT_PUREZA_MINIMA, help="Pureza mínima para parada de refinamento (padrão: 0.80)")
+    parser.add_argument("--tamanho-minimo", type=int, default=DEFAULT_TAMANHO_MINIMO, help="Tamanho mínimo de cluster para refinamento (padrão: 15)")
+    parser.add_argument("--profundidade-maxima", type=int, default=DEFAULT_PROFUNDIDADE_MAXIMA, help="Profundidade máxima de recursão no refinamento (padrão: 3)")
     parser.add_argument("--pca", type=int, default=None, help="Número de componentes principais (PCA) para redução de dimensionalidade")
     parser.add_argument("--seed", type=int, default=42, help="Seed para reprodutibilidade (padrão: 42)")
     parser.add_argument("--exportar-playlists", action="store_true", help="Cria playlists por cluster no MPD e em arquivos .m3u")
@@ -991,6 +1372,10 @@ if __name__ == "__main__":
         k_min=args.k_min,
         k_max=args.k_max,
         algorithm=args.algoritmo,
+        modo=args.modo,
+        pureza_minima=args.pureza_minima,
+        tamanho_minimo=args.tamanho_minimo,
+        profundidade_maxima=args.profundidade_maxima,
         n_pca=args.pca,
         seed=args.seed,
         export_playlists=args.exportar_playlists,
