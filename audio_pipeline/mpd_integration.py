@@ -15,6 +15,13 @@ import vector_store
 import auto_indexer
 import status_window
 
+try:
+    import feedback
+    import feedback_config
+    HAS_FEEDBACK = True
+except ImportError:
+    HAS_FEEDBACK = False
+
 # --- Constantes de Configuração da Recomendação ---
 HISTORY_SIZE_DEFAULT = 30
 MIN_QUEUE_AHEAD = 2
@@ -236,12 +243,14 @@ def select_next_recommendations(
     top_n: int = TOP_N_VARIETY,
     random_seed: int | None = RANDOM_SEED,
     msg_queue: queue.Queue = None,
-    recommendation_mode: str = "similarity"
+    recommendation_mode: str = "similarity",
+    use_feedback: bool = True
 ) -> tuple[str, dict, int] | None:
     """
     Seleciona a melhor candidata evitando histórico, fila atual e faixas com falha.
     Suporta recommendation_mode='similarity' (K-NN padrão) ou recommendation_mode='cluster'
     (prioriza faixas pertencentes ao mesmo cluster sonoro da faixa atual).
+    Quando use_feedback=True, aplica adaptação Rocchio na consulta e re-ranking com penalidades por skip.
     """
     if history is None:
         history = []
@@ -261,7 +270,21 @@ def select_next_recommendations(
     current_cluster = current_meta.get('cluster_id') if current_meta else None
     current_cluster_nome = current_meta.get('cluster_nome') if current_meta else None
 
+    # Aplicação de Rocchio na consulta vetorial se feedback estiver ativo
+    search_emb = query_emb
+    feedback_engine = None
+    if use_feedback and HAS_FEEDBACK:
+        try:
+            feedback_engine = feedback.FeedbackEngine()
+            search_emb, roc_stats = feedback_engine.compute_rocchio_query(query_emb, collection)
+            if roc_stats.get("applied") and msg_queue:
+                msg_queue.put({"type": "log", "text": f"Rocchio ativo ({roc_stats['n_pos']} pos, {roc_stats['n_neg']} skips)"})
+        except Exception as e:
+            logging.warning(f"Erro ao calcular Rocchio: {e}")
+            search_emb = query_emb
+
     similares = []
+    search_k = feedback_config.CANDIDATES_N if (use_feedback and HAS_FEEDBACK) else k
 
     # Se modo for cluster e houver cluster válido associado
     if recommendation_mode == "cluster" and current_cluster and current_cluster != "ruido":
@@ -275,7 +298,7 @@ def select_next_recommendations(
             c_metas = cluster_tracks.get("metadatas", [])
 
             cluster_candidates = []
-            norm_q = query_emb / (np.linalg.norm(query_emb) + 1e-9)
+            norm_q = search_emb / (np.linalg.norm(search_emb) + 1e-9)
 
             for cid, cemb, cmeta in zip(c_ids, c_embs, c_metas):
                 if cid == current_track_id:
@@ -294,7 +317,7 @@ def select_next_recommendations(
 
             # Ordena por menor distância (maior similaridade dentro do cluster)
             cluster_candidates.sort(key=lambda x: x["distance"])
-            similares = cluster_candidates[:k]
+            similares = cluster_candidates[:search_k]
             if similares and msg_queue:
                 display_name = current_cluster_nome or current_cluster
                 msg_queue.put({"type": "log", "text": f"Modo Cluster ativo: {display_name} ({current_cluster}) ({len(similares)} candidatas)"})
@@ -303,10 +326,29 @@ def select_next_recommendations(
 
     # Se não for modo cluster ou não retornou candidatas, usa K-NN padrão
     if not similares:
-        similares = vector_store.query_similar(collection, query_emb, k=k, exclude_id=current_track_id)
+        similares = vector_store.query_similar(collection, search_emb, k=search_k, exclude_id=current_track_id)
 
     if not similares:
         return None
+
+    # Re-ranking com penalidades de feedback se ativo
+    if use_feedback and HAS_FEEDBACK and feedback_engine:
+        try:
+            reranked = feedback_engine.rerank_candidates(
+                query_emb=query_emb,
+                candidates=similares,
+                collection=collection,
+                id_to_file_map=id_to_file_map,
+                queued_files=queued_files
+            )
+            if reranked:
+                similares = reranked[:k]
+                if msg_queue:
+                    top_cand = similares[0]
+                    pen_str = f"pen_g={top_cand.get('genre_penalty', 0):.2f}"
+                    msg_queue.put({"type": "log", "text": f"Re-ranking feedback aplicado ({len(similares)} candidatas, {pen_str})"})
+        except Exception as e:
+            logging.warning(f"Erro ao aplicar re-ranking de feedback: {e}")
 
     hist_set = set(history)
 
@@ -381,7 +423,8 @@ def replenish_mpd_queue(
     msg_queue: queue.Queue = None,
     on_rec_success: callable = None,
     on_error: callable = None,
-    recommendation_mode: str = "similarity"
+    recommendation_mode: str = "similarity",
+    use_feedback: bool = True
 ) -> int:
     """Garante que a fila do MPD tenha pelo menos `min_queue_ahead` faixas à frente da atual."""
     playlist = client.playlistinfo()
@@ -419,7 +462,8 @@ def replenish_mpd_queue(
             top_n=top_n,
             random_seed=random_seed,
             msg_queue=msg_queue,
-            recommendation_mode=recommendation_mode
+            recommendation_mode=recommendation_mode,
+            use_feedback=use_feedback
         )
 
         if not selection:
@@ -464,16 +508,56 @@ def replenish_mpd_queue(
 
     return added_count
 
-def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, id_to_file_map: dict, trigger_mode: str = "on_change", music_root: str = "", metadata_path: str = "", known_fingerprints: dict = None, msg_queue: queue.Queue = None, recommendation_mode: str = "similarity") -> None:
+def monitor_and_recommend(
+    client: MPDClient,
+    collection,
+    file_to_id_map: dict,
+    id_to_file_map: dict,
+    trigger_mode: str = "on_change",
+    music_root: str = "",
+    metadata_path: str = "",
+    known_fingerprints: dict = None,
+    msg_queue: queue.Queue = None,
+    recommendation_mode: str = "similarity",
+    use_feedback: bool = True
+) -> None:
     """Loop principal que aguarda mudanças no MPD e enfileira recomendações com garantia de reposição."""
     if known_fingerprints is None:
         known_fingerprints = {}
     last_processed_file = None
+    prev_song = None
+    prev_status = None
+
+    # Inicializa detector de feedback se ativo
+    feedback_detector = None
+    if use_feedback and HAS_FEEDBACK:
+        try:
+            feedback_storage = feedback.FeedbackStorage()
+            feedback_detector = feedback.FeedbackDetector(feedback_storage)
+            logging.info("Detector de feedback implícito (skips/completas) ATIVO.")
+            if msg_queue:
+                msg_queue.put({"type": "log", "text": "Módulo de Feedback por Skip ATIVO"})
+        except Exception as e:
+            logging.warning(f"Não foi possível inicializar detector de feedback: {e}")
+
+    def resolve_track_metadata(filepath_str: str) -> Optional[Dict[str, Any]]:
+        tid = file_to_id_map.get(filepath_str)
+        if tid:
+            try:
+                res = collection.get(ids=[tid], include=["metadatas"])
+                metas = res.get("metadatas", [])
+                if metas and metas[0]:
+                    d = dict(metas[0])
+                    d["track_id"] = tid
+                    return d
+            except Exception:
+                pass
+        return None
 
     # Limitar HISTORY_SIZE a no máximo 50% das faixas indexadas
     total_indexed = max(1, len(file_to_id_map))
     effective_history_size = min(HISTORY_SIZE_DEFAULT, max(2, total_indexed // 2))
-    logging.info(f"Tamanho do histórico de sessão configurado: {effective_history_size} faixas (total indexado: {total_indexed}). Modo de recomendação: {recommendation_mode}.")
+    logging.info(f"Tamanho do histórico de sessão configurado: {effective_history_size} faixas (total indexado: {total_indexed}). Modo de recomendação: {recommendation_mode}. Feedback implícito: {'LIGADO' if (use_feedback and HAS_FEEDBACK) else 'DESLIGADO'}.")
 
     play_history = load_session_history(SESSION_HISTORY_FILE, max_len=effective_history_size)
     failed_tracks = set()
@@ -521,6 +605,24 @@ def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, i
                     
                     if current_file == last_processed_file:
                         continue
+
+                    # Avaliação de feedback implícito (skip / completa) da faixa anterior
+                    if feedback_detector and prev_song and prev_status:
+                        try:
+                            ev = feedback_detector.evaluate_transition(
+                                prev_song=prev_song,
+                                prev_status=prev_status,
+                                current_song=current_song,
+                                current_status=status,
+                                meta_resolver=resolve_track_metadata
+                            )
+                            if ev and msg_queue:
+                                msg_queue.put({"type": "log", "text": f"Feedback registrado: {ev.upper()}"})
+                        except Exception as e:
+                            logging.warning(f"Erro ao detectar feedback: {e}")
+
+                    prev_song = current_song
+                    prev_status = status
                         
                     logging.info(f"Usuário ouvindo: {current_file}")
                     if msg_queue:
@@ -615,7 +717,8 @@ def monitor_and_recommend(client: MPDClient, collection, file_to_id_map: dict, i
                                 msg_queue=msg_queue,
                                 on_rec_success=handle_rec_success,
                                 on_error=handle_err,
-                                recommendation_mode=recommendation_mode
+                                recommendation_mode=recommendation_mode,
+                                use_feedback=use_feedback
                             )
                             # Se a constante permitir, retoma a reprodução automaticamente
                             if AUTO_RESUME_PLAY_ON_STOP:
@@ -641,7 +744,8 @@ def run_recommender(
     music_root: str = None,
     mode: str = "cluster",
     trigger_mode: str = "on_change",
-    gui: bool = True
+    gui: bool = True,
+    use_feedback: bool = True
 ) -> None:
     """
     Ponto de entrada público para executar o recomendador em primeiro plano.
@@ -675,7 +779,8 @@ def run_recommender(
     logging.info(f"Conectado ao MPD em {config.MPD_HOST}:{config.MPD_PORT}.")
 
     print("\n=============================================")
-    print(f"Sistema de Recomendação Ativo (Modo: {mode}) e Monitorando...")
+    fb_label = "LIGADO" if use_feedback else "DESLIGADO (--sem-feedback)"
+    print(f"Sistema de Recomendação Ativo (Modo: {mode} | Feedback: {fb_label})")
     print("Pressione Ctrl+C para encerrar.")
     print("=============================================\n")
 
@@ -684,7 +789,7 @@ def run_recommender(
     # 5. Loop principal em Background Thread
     mpd_thread = threading.Thread(
         target=monitor_and_recommend,
-        args=(mpd_client, collection, file_to_id, id_to_file, trigger_mode, music_root, metadata_path, known_fingerprints, msg_queue, mode),
+        args=(mpd_client, collection, file_to_id, id_to_file, trigger_mode, music_root, metadata_path, known_fingerprints, msg_queue, mode, use_feedback),
         daemon=True
     )
     mpd_thread.start()
@@ -719,6 +824,7 @@ if __name__ == "__main__":
     parser.add_argument("--trigger_mode", type=str, choices=["on_change", "near_end"], default="on_change")
     parser.add_argument("--music_root", type=str, help="Caminho absoluto da biblioteca (pula prompt)")
     parser.add_argument("--mode", type=str, choices=["similarity", "cluster"], default="similarity", help="Modo de recomendação")
+    parser.add_argument("--sem-feedback", action="store_true", help="Desativa feedback implícito por skip")
     parser.add_argument("--exportar-playlists", action="store_true", help="Exporta uma playlist por cluster para o MPD e sai")
     parser.add_argument("--no-gui", action="store_true", help="Executa apenas no console sem abrir janela gráfica")
     
@@ -765,6 +871,7 @@ if __name__ == "__main__":
         music_root=m_root,
         mode=args.mode,
         trigger_mode=args.trigger_mode,
-        gui=not args.no_gui
+        gui=not args.no_gui,
+        use_feedback=not args.sem_feedback
     )
 

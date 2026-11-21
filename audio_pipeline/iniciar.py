@@ -260,17 +260,20 @@ def etapa_4_playlists(music_root: Path) -> None:
 def etapa_6_recomendador(
     music_root: Path,
     mode: str = "cluster",
-    gui: bool = True
+    gui: bool = True,
+    use_feedback: bool = True
 ) -> None:
     """
     Etapa 6: Inicia o sistema de recomendação em primeiro plano.
     """
-    logger.info(f"[6/6] Iniciando Recomendador Musical ativo (Modo: '{mode}')...")
+    fb_txt = "ativo" if use_feedback else "desativado (--sem-feedback)"
+    logger.info(f"[6/6] Iniciando Recomendador Musical (Modo: '{mode}' | Feedback por Skip: {fb_txt})...")
     mpd_integration.run_recommender(
         metadata_path=config.METADATA_PATH,
         music_root=str(music_root),
         mode=mode,
-        gui=gui
+        gui=gui,
+        use_feedback=use_feedback
     )
 
 
@@ -279,6 +282,7 @@ def main():
     parser.add_argument("--pasta", type=str, default=None, help="Caminho absoluto da pasta de músicas (Google Drive / local)")
     parser.add_argument("--recalcular", action="store_true", help="Força recálculo completo da clusterização K-Means do zero")
     parser.add_argument("--modo", type=str, choices=["refinado", "nao-supervisionado", "por-genero"], default="refinado", help="Modo de clusterização: refinado (padrão), nao-supervisionado, por-genero")
+    parser.add_argument("--sem-feedback", action="store_true", help="Desativa feedback implícito por skip (baseline sem reforço)")
     parser.add_argument("--pureza-minima", type=float, default=0.80, help="Pureza mínima para parada de refinamento (padrão: 0.80)")
     parser.add_argument("--tamanho-minimo", type=int, default=15, help="Tamanho mínimo de cluster para refinamento (padrão: 15)")
     parser.add_argument("--profundidade-maxima", type=int, default=3, help="Profundidade máxima de refinamento recursivo (padrão: 3)")
@@ -413,7 +417,8 @@ def main():
         etapa_6_recomendador(
             music_root=music_root,
             mode=rec_mode,
-            gui=not args.no_gui
+            gui=not args.no_gui,
+            use_feedback=not args.sem_feedback
         )
 
     except KeyboardInterrupt:
