@@ -152,6 +152,67 @@ def normalize_mpd_filepath(raw_path: str, music_root: str = "") -> str:
 
     return norm_path.replace('\\', '/')
 
+# Rastreamento de faixas adicionadas pelo recomendador e sua origem ('recomendada' ou 'exploracao')
+RECOMMENDER_ADDED_TRACKS: Dict[str, str] = {}
+
+def sync_mpd_queue_state(
+    client: MPDClient,
+    file_to_id_map: dict,
+    collection,
+    music_root: str,
+    feedback_storage
+) -> None:
+    """Sincroniza a fila do MPD no feedback.db com a origem de cada faixa (manual, recomendada, exploracao)."""
+    if not feedback_storage:
+        return
+    try:
+        playlist = client.playlistinfo()
+        status = client.status()
+        current_pos = int(status.get("song", -1))
+        curr_info = client.currentsong()
+        current_file = curr_info.get("file", "")
+
+        track_ids = []
+        for it in playlist:
+            f = it.get("file", "")
+            norm_f = normalize_mpd_filepath(f, music_root)
+            tid = file_to_id_map.get(norm_f) or file_to_id_map.get(f) or ""
+            if tid:
+                track_ids.append(tid)
+
+        metas_map = {}
+        if track_ids:
+            try:
+                res = collection.get(ids=list(set(track_ids)), include=["metadatas"])
+                for tid, m in zip(res.get("ids", []), res.get("metadatas", [])):
+                    if m:
+                        metas_map[tid] = m
+            except Exception:
+                pass
+
+        queue_items = []
+        for idx, it in enumerate(playlist):
+            f = it.get("file", "")
+            norm_f = normalize_mpd_filepath(f, music_root)
+            tid = file_to_id_map.get(norm_f) or file_to_id_map.get(f) or ""
+            meta = metas_map.get(tid, {})
+            
+            origem = RECOMMENDER_ADDED_TRACKS.get(f) or RECOMMENDER_ADDED_TRACKS.get(norm_f) or "manual"
+            is_curr = (f == current_file or idx == current_pos)
+            queue_items.append({
+                "pos": idx,
+                "caminho": f,
+                "track_id": tid,
+                "genero": meta.get("subgenero", ""),
+                "cluster": meta.get("cluster_nome", str(meta.get("cluster_id", ""))),
+                "origem": origem,
+                "is_current": is_curr
+            })
+
+        feedback_storage.update_queue_state(queue_items)
+    except Exception as e:
+        logging.debug(f"Erro ao sincronizar fila no SQLite: {e}")
+
 def load_session_history(filepath: str = SESSION_HISTORY_FILE, max_len: int = HISTORY_SIZE_DEFAULT) -> deque:
     """Carrega o histórico de faixas persistido em disco de forma tolerante a corrupção."""
     if os.path.exists(filepath):
@@ -405,6 +466,90 @@ def select_next_recommendations(
         chosen_rank, chosen_rec = rng.choice(pool)
 
     chosen_file = id_to_file_map.get(chosen_rec['track_id'])
+
+    # ── Auditoria e Log Detalhado da Decisão ──────────────────────────────
+    is_exploration = (chosen_rank > 0)
+    origem = "exploracao" if is_exploration else "recomendada"
+
+    seed_file = id_to_file_map.get(current_track_id, "")
+    seed_name = os.path.basename(seed_file) if seed_file else current_track_id
+    seed_genero = current_meta.get("subgenero", "Desconhecido")
+
+    genre_penalties = {}
+    events_str = "Nenhum"
+    q_norm_val = float(np.linalg.norm(search_emb))
+    q_summary = f"||q'||={q_norm_val:.3f}"
+
+    if feedback_engine:
+        genre_penalties = feedback_engine.storage.get_genre_penalties()
+        if roc_stats.get("applied"):
+            q_summary += f" (Rocchio: {roc_stats['n_pos']} pos, {roc_stats['n_neg']} neg)"
+
+        recent_pos = roc_stats.get("pos_events", [])
+        recent_neg = roc_stats.get("neg_events", [])
+        all_evs = sorted(recent_pos + recent_neg, key=lambda x: str(x.get("timestamp", "")), reverse=True)
+        if all_evs:
+            events_str = ", ".join([
+                f"[{str(e.get('timestamp', ''))[:19]}] {e.get('tipo', '').upper()}:{e.get('genero', '')} ({e.get('elapsed', 0):.0f}s)"
+                for e in all_evs[:4]
+            ])
+            if len(all_evs) > 4:
+                events_str += f" (+{len(all_evs)-4} outros)"
+
+    pen_str = ", ".join([f"{g}: {val:.2f}" for g, val in genre_penalties.items() if val > 0]) or "Nenhuma"
+    cand_name = os.path.basename(chosen_file) if chosen_file else chosen_rec['track_id']
+    cand_gen = chosen_rec.get("subgenero", "Desconhecido")
+    final_score = chosen_rec.get("final_score", float(1.0 - chosen_rec.get("distance", 1.0)))
+
+    logging.info(
+        f"\n[AUDITORIA DE RECOMENDAÇÃO]\n"
+        f"  • Seed Usado:          {seed_name} (Gênero: {seed_genero}, ID: {current_track_id})\n"
+        f"  • Consulta q':         {q_summary}\n"
+        f"  • Penalidades Gênero:  {pen_str}\n"
+        f"  • Eventos Feedback:    {events_str}\n"
+        f"  • Faixa Escolhida:     {cand_name} (Gênero: {cand_gen})\n"
+        f"  • Cota de Exploração:  {'SIM (escolha rank #' + str(chosen_rank + 1) + ')' if is_exploration else 'NÃO (melhor score rank #1)'}\n"
+        f"  • Score Final:         {final_score:.4f}"
+    )
+
+    # Gravar decisão no SQLite feedback.db (modo WAL) para leitura concorrente pelo monitor
+    if feedback_engine:
+        try:
+            candidatas_detalhes = []
+            for rank_idx, cand in enumerate(similares[:15]):
+                c_id = cand.get("track_id", "")
+                c_f = id_to_file_map.get(c_id, "")
+                candidatas_detalhes.append({
+                    "rank": rank_idx + 1,
+                    "track_id": c_id,
+                    "filename": os.path.basename(c_f) if c_f else c_id,
+                    "subgenero": cand.get("subgenero", ""),
+                    "cluster_nome": cand.get("cluster_nome", str(cand.get("cluster_id", ""))),
+                    "sim_query": cand.get("sim_query", float(1.0 - cand.get("distance", 1.0))),
+                    "track_penalty": cand.get("track_penalty", 0.0),
+                    "genre_penalty": cand.get("genre_penalty", 0.0),
+                    "final_score": cand.get("final_score", float(1.0 - cand.get("distance", 1.0))),
+                    "motivo": "Selecionada" if c_id == chosen_rec['track_id'] else cand.get("motivo", "Candidata alternativa"),
+                    "rejeitada": cand.get("rejeitada", False)
+                })
+
+            feedback_engine.storage.record_decision(
+                seed_track_id=current_track_id,
+                seed_caminho=seed_file,
+                seed_genero=seed_genero,
+                escolhida_track_id=chosen_rec['track_id'],
+                escolhida_caminho=chosen_file or "",
+                escolhida_genero=cand_gen,
+                escolhida_cluster=str(chosen_rec.get("cluster_id", "")),
+                origem=origem,
+                rank_escolhido=chosen_rank,
+                score_escolhido=final_score,
+                penalidades=genre_penalties,
+                candidatas_detalhes=candidatas_detalhes
+            )
+        except Exception as e:
+            logging.warning(f"Erro ao registrar auditoria no feedback.db: {e}")
+
     return chosen_file, chosen_rec, chosen_rank
 
 def replenish_mpd_queue(
@@ -440,6 +585,27 @@ def replenish_mpd_queue(
     added_count = 0
     attempts = 0
 
+    feedback_storage = None
+    if use_feedback and HAS_FEEDBACK:
+        try:
+            feedback_storage = feedback.FeedbackStorage()
+        except Exception:
+            pass
+
+    # A busca de reposição deve partir da FAIXA EM REPRODUÇÃO (e do q' atualizado), não da última da fila.
+    active_seed_id = current_track_id
+    try:
+        if status.get("state") == "play":
+            curr_song = client.currentsong()
+            curr_file = curr_song.get("file")
+            if curr_file:
+                norm_curr = normalize_mpd_filepath(curr_file, music_root)
+                resolved_id = file_to_id_map.get(norm_curr) or file_to_id_map.get(curr_file)
+                if resolved_id:
+                    active_seed_id = resolved_id
+    except Exception as e:
+        logging.debug(f"Falha ao checar faixa em reprodução: {e}")
+
     while ahead < min_queue_ahead and attempts < max_tries:
         attempts += 1
 
@@ -453,7 +619,7 @@ def replenish_mpd_queue(
 
         selection = select_next_recommendations(
             collection=collection,
-            current_track_id=current_track_id,
+            current_track_id=active_seed_id,  # <-- SEMPRE parte da faixa em reprodução!
             id_to_file_map=id_to_file_map,
             k=CANDIDATES_K,
             history=play_history,
@@ -479,6 +645,10 @@ def replenish_mpd_queue(
 
         try:
             client.add(candidate_file)
+            origem = "exploracao" if candidate_rank > 0 else "recomendada"
+            RECOMMENDER_ADDED_TRACKS[candidate_file] = origem
+            RECOMMENDER_ADDED_TRACKS[normalize_mpd_filepath(candidate_file, music_root)] = origem
+
             logging.info(f"Recomendada '{candidate_file}' (posição #{candidate_rank + 1} na lista de candidatas, distância: {dist:.4f})")
             if msg_queue:
                 msg_queue.put({"type": "recommendation", "text": f"{os.path.basename(candidate_file)} (Adicionada!)"})
@@ -506,6 +676,11 @@ def replenish_mpd_queue(
             if msg_queue:
                 msg_queue.put({"type": "recommendation", "text": f"{os.path.basename(candidate_file)} (Falhou)"})
                 msg_queue.put({"type": "log", "text": f"Candidata rejeitada (add falhou): {os.path.basename(candidate_file)}"})
+
+    if feedback_storage:
+        sync_mpd_queue_state(client, file_to_id_map, collection, music_root, feedback_storage)
+
+    return added_count
 
     return added_count
 
@@ -690,8 +865,13 @@ def monitor_and_recommend(
                         msg_queue=msg_queue,
                         on_rec_success=handle_rec_success,
                         on_error=handle_err,
-                        recommendation_mode=recommendation_mode
+                        recommendation_mode=recommendation_mode,
+                        use_feedback=use_feedback
                     )
+
+                    # Sincroniza estado da fila no feedback.db para o monitor ao vivo
+                    if feedback_detector:
+                        sync_mpd_queue_state(client, file_to_id_map, collection, music_root, feedback_detector.storage)
 
                 elif state == "stop":
                     # Fila esgotada ou usuário parou a reprodução
@@ -746,7 +926,8 @@ def run_recommender(
     mode: str = "cluster",
     trigger_mode: str = "on_change",
     gui: bool = True,
-    use_feedback: bool = True
+    use_feedback: bool = True,
+    zerar_feedback: bool = False
 ) -> None:
     """
     Ponto de entrada público para executar o recomendador em primeiro plano.
@@ -759,6 +940,15 @@ def run_recommender(
 
     music_root = os.path.abspath(music_root)
     logging.info(f"Iniciando Recomendador Musical. Pasta base: {music_root}")
+
+    # Limpar feedback anterior se solicitado
+    if zerar_feedback and HAS_FEEDBACK:
+        try:
+            fb_storage = feedback.FeedbackStorage()
+            fb_storage.clear_history()
+            logging.info("Histórico de feedback.db totalmente zerado via --zerar-feedback.")
+        except Exception as e:
+            logging.warning(f"Erro ao zerar feedback: {e}")
 
     # 1. Carregar metadados e mapear caminhos
     logging.info("Construindo mapeamento de arquivos...")
@@ -826,6 +1016,7 @@ if __name__ == "__main__":
     parser.add_argument("--music_root", type=str, help="Caminho absoluto da biblioteca (pula prompt)")
     parser.add_argument("--mode", type=str, choices=["similarity", "cluster"], default="similarity", help="Modo de recomendação")
     parser.add_argument("--sem-feedback", action="store_true", help="Desativa feedback implícito por skip")
+    parser.add_argument("--zerar-feedback", action="store_true", help="Limpa o banco de dados feedback.db antes de iniciar")
     parser.add_argument("--exportar-playlists", action="store_true", help="Exporta uma playlist por cluster para o MPD e sai")
     parser.add_argument("--no-gui", action="store_true", help="Executa apenas no console sem abrir janela gráfica")
     
@@ -873,6 +1064,7 @@ if __name__ == "__main__":
         mode=args.mode,
         trigger_mode=args.trigger_mode,
         gui=not args.no_gui,
-        use_feedback=not args.sem_feedback
+        use_feedback=not args.sem_feedback,
+        zerar_feedback=args.zerar_feedback
     )
 

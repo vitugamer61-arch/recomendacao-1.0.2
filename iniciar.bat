@@ -14,6 +14,7 @@ REM Flags opcionais (passar como argumentos):
 REM   --recalcular     Refaz a clusterizacao do zero
 REM   --modo <modo>    Modo de clusterizacao: refinado (padrao), nao-supervisionado, por-genero
 REM   --sem-feedback   Desativa o feedback implicito por skip (baseline)
+REM   --zerar-feedback Limpa todo o historico do feedback.db antes de iniciar
 REM   --sem-cluster    Inicia somente o recomendador K-NN classico
 REM   --sem-monitor    Nao inicia o Monitor de Precisao (Streamlit)
 REM   --pasta <caminho> Define o caminho da pasta de musicas

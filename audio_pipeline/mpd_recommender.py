@@ -22,6 +22,7 @@ if __name__ == "__main__":
     parser.add_argument("--music_root", type=str, help="Caminho absoluto da biblioteca (pula prompt)")
     parser.add_argument("--mode", type=str, choices=["similarity", "cluster"], default="cluster", help="Modo de recomendação")
     parser.add_argument("--sem-feedback", action="store_true", help="Desativa feedback implícito por skip")
+    parser.add_argument("--zerar-feedback", action="store_true", help="Limpa o banco de dados feedback.db antes de iniciar")
     parser.add_argument("--no-gui", action="store_true", help="Executa apenas no console sem abrir janela gráfica")
     
     args = parser.parse_args()
@@ -35,6 +36,7 @@ if __name__ == "__main__":
         mode=args.mode,
         trigger_mode=args.trigger_mode,
         gui=not args.no_gui,
-        use_feedback=not args.sem_feedback
+        use_feedback=not args.sem_feedback,
+        zerar_feedback=args.zerar_feedback
     )
 

@@ -9,22 +9,27 @@ from pathlib import Path
 _BASE_DIR = Path(__file__).parent.resolve()
 DEFAULT_DB_PATH = _BASE_DIR / "results" / "feedback.db"
 
-# ── 1. Detecção de Feedback (Heurística de Reprodução) ─────────────────────────
-# Skip manual: troca de faixa antes de 30 segundos ou 30% da duração total
+# ── 1. Detecção de Feedback Gradual (Heurística de Reprodução) ────────────────
+# Skip manual: troca de faixa antes de 30 segundos (peso negativo forte)
 SKIP_MAX_ELAPSED_SECONDS = 30.0
-SKIP_MAX_DURATION_RATIO = 0.30
 
-# Faixa completa (feedback positivo): ouvida até pelo menos 80% da duração
+# Feedback positivo fraco (reprodução parcial): de 30 segundos até 80% da duração
+# Peso positivo proporcional à fração ouvida f = elapsed / duration
+PARTIAL_MIN_ELAPSED_SECONDS = 30.0
 COMPLETE_MIN_DURATION_RATIO = 0.80
 
 # Tolerância para fim natural da faixa (segundos restantes para considerar fim da música)
 NATURAL_END_TOLERANCE_SECONDS = 2.0
 
+# Pesos base por tipo de evento
+SKIP_WEIGHT_BASE = -1.0       # Negativo forte
+COMPLETE_WEIGHT_BASE = 1.0    # Positivo forte
+
 
 # ── 2. Algoritmo Rocchio no Vetor de Consulta (q') ────────────────────────────
 # q' = normalize(α·q + β·média(positivas) − γ·média(puladas))
 ROCCHIO_ALPHA = 1.0   # Peso da consulta original
-ROCCHIO_BETA = 0.5    # Peso das faixas positivas (completadas)
+ROCCHIO_BETA = 0.5    # Peso das faixas positivas (completadas e parciais ponderadas)
 ROCCHIO_GAMMA = 0.7   # Peso das faixas negativas (puladas)
 
 # Quantidade de faixas recentes consideradas no Rocchio
@@ -50,13 +55,14 @@ EXCLUDE_RECENT_SKIPS_COUNT = 10
 
 # ── 4. Penalidade de Gênero e Cooldown ─────────────────────────────────────────
 # Pontuação de penalidade cumulativa por gênero:
-# +1.0 por skip, -0.5 por faixa completa (mínimo 0.0)
+# +1.0 por skip, -0.5 por faixa completa, -0.5*f por parcial (mínimo 0.0)
 PENALTY_SKIP_GENRE = 1.0
 BONUS_COMPLETE_GENRE = 0.5
 GENRE_MIN_PENALTY = 0.0
 
-# Decaimento temporal da penalidade de gênero (em segundos ou por evento)
-GENRE_PENALTY_HALF_LIFE_SECONDS = 1800.0  # 30 minutos
+# Meia-vida do decaimento temporal contínuo das penalidades (em segundos)
+# P(t) = P_0 * 2^(-dt / meia_vida). Padrão: 1800s (30 minutos)
+GENRE_PENALTY_HALF_LIFE_SECONDS = 1800.0
 
 # Regra de Cooldown por Skips Consecutivos:
 # Se o usuário pular 3 ou mais faixas do mesmo gênero em uma janela de tempo,
@@ -64,4 +70,3 @@ GENRE_PENALTY_HALF_LIFE_SECONDS = 1800.0  # 30 minutos
 GENRE_COOLDOWN_SKIP_THRESHOLD = 3
 GENRE_COOLDOWN_WINDOW_SECONDS = 600.0     # Janela de 10 minutos
 GENRE_COOLDOWN_DURATION_SECONDS = 300.0   # 5 minutos de cooldown
-

@@ -220,6 +220,122 @@ class TestFeedback(unittest.TestCase):
         # cand_neutral (sem penalidade de gênero Rock nem proximidade acústica ao skip) fica acima
         self.assertEqual(reranked[0]["track_id"], "cand_neutral")
 
+    def test_feedback_gradual_weights_and_categories(self):
+        """Valida a classificação do feedback gradual: skip (<30s), parcial (30s-80%) e completa (>=80%)."""
+        # 1. Skip precoce (< 30s)
+        ev_skip = self.detector.evaluate_transition(
+            prev_song={"file": "Sertanejo/1.mp3", "pos": 0, "duration": 180.0},
+            prev_status={"song": "0", "elapsed": 15.0, "duration": 180.0, "state": "play"},
+            current_song={"file": "Sertanejo/2.mp3", "pos": 1},
+            current_status={"song": "1", "state": "play"}
+        )
+        self.assertEqual(ev_skip, "skip")
+
+        # 2. Reprodução parcial (30s até 80%)
+        ev_parcial = self.detector.evaluate_transition(
+            prev_song={"file": "Sertanejo/2.mp3", "pos": 1, "duration": 180.0},
+            prev_status={"song": "1", "elapsed": 45.0, "duration": 180.0, "state": "play"},
+            current_song={"file": "Sertanejo/3.mp3", "pos": 2},
+            current_status={"song": "2", "state": "play"}
+        )
+        self.assertEqual(ev_parcial, "parcial")
+
+        # 3. Reprodução completa (>= 80%)
+        ev_completa = self.detector.evaluate_transition(
+            prev_song={"file": "Sertanejo/3.mp3", "pos": 2, "duration": 180.0},
+            prev_status={"song": "2", "elapsed": 160.0, "duration": 180.0, "state": "play"},
+            current_song={"file": "Sertanejo/4.mp3", "pos": 3},
+            current_status={"song": "3", "state": "play"}
+        )
+        self.assertEqual(ev_completa, "completa")
+
+        # Verifica que parciais e completas são positivas
+        positives = self.storage.get_recent_positives()
+        self.assertEqual(len(positives), 2)
+        tipos_pos = [p["tipo"] for p in positives]
+        self.assertIn("completa", tipos_pos)
+        self.assertIn("parcial", tipos_pos)
+
+    def test_regression_play_30s_majority_genre(self):
+        """
+        Teste de Regressão (Requisito 3):
+        Com estado zerado, tocar 30 s de uma faixa do gênero X (ex.: Sertanejo).
+        Verifica que a maioria (>= 70%) das próximas K=5 recomendadas é do gênero X.
+        """
+        self.storage.clear_history()
+        genero_alvo = "Sertanejo"
+
+        # Simula biblioteca com clusters de gêneros
+        dim = 8
+        base_sertanejo = np.array([1.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        base_sertanejo /= np.linalg.norm(base_sertanejo)
+
+        base_mpb = np.array([0.0, 0.0, 1.0, 0.2, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        base_mpb /= np.linalg.norm(base_mpb)
+
+        # Faixa tocada por 30 segundos
+        seed_id = "sert_01"
+        seed_emb = base_sertanejo.copy()
+
+        # Faixas candidatas no acervo
+        embs_dict = {seed_id: seed_emb}
+        metas_dict = {seed_id: {"subgenero": genero_alvo, "cluster_id": "c_sert"}}
+        id_to_file = {seed_id: "Sertanejo/faixa_01.mp3"}
+
+        candidatas = []
+        # 6 faixas de Sertanejo
+        for i in range(2, 8):
+            tid = f"sert_{i:02d}"
+            noise = np.random.normal(0, 0.05, size=dim).astype(np.float32)
+            v = base_sertanejo + noise
+            v /= np.linalg.norm(v)
+            embs_dict[tid] = v
+            metas_dict[tid] = {"subgenero": genero_alvo, "cluster_id": "c_sert"}
+            id_to_file[tid] = f"Sertanejo/faixa_{i:02d}.mp3"
+            sim = float(np.dot(seed_emb, v))
+            candidatas.append({"track_id": tid, "subgenero": genero_alvo, "cluster_id": "c_sert", "distance": 1.0 - sim})
+
+        # 4 faixas de MPB
+        for i in range(1, 5):
+            tid = f"mpb_{i:02d}"
+            noise = np.random.normal(0, 0.05, size=dim).astype(np.float32)
+            v = base_mpb + noise
+            v /= np.linalg.norm(v)
+            embs_dict[tid] = v
+            metas_dict[tid] = {"subgenero": "MPB", "cluster_id": "c_mpb"}
+            id_to_file[tid] = f"MPB/faixa_{i:02d}.mp3"
+            sim = float(np.dot(seed_emb, v))
+            candidatas.append({"track_id": tid, "subgenero": "MPB", "cluster_id": "c_mpb", "distance": 1.0 - sim})
+
+        mock_col = MockCollection(embs_dict, metas_dict)
+
+        # Tocar 30 segundos da faixa seed de Sertanejo
+        ev = self.detector.evaluate_transition(
+            prev_song={"file": "Sertanejo/faixa_01.mp3", "pos": 0, "duration": 180.0},
+            prev_status={"song": "0", "elapsed": 30.0, "duration": 180.0, "state": "play"},
+            current_song={"file": "Sertanejo/faixa_02.mp3", "pos": 1},
+            current_status={"song": "1", "state": "play"},
+            meta_resolver=lambda f: {"track_id": seed_id, "subgenero": genero_alvo, "cluster_id": "c_sert"}
+        )
+        self.assertEqual(ev, "parcial")
+
+        # Calcula consulta Rocchio e re-ranking partindo da faixa tocando
+        q_prime, _ = self.engine.compute_rocchio_query(seed_emb, mock_col)
+        reranked = self.engine.rerank_candidates(
+            query_emb=q_prime,
+            candidates=candidatas,
+            collection=mock_col,
+            id_to_file_map=id_to_file,
+            queued_files={"Sertanejo/faixa_01.mp3"}
+        )
+
+        top_k = reranked[:5]
+        sertanejo_count = sum(1 for c in top_k if c.get("subgenero") == genero_alvo)
+        fracao = sertanejo_count / 5.0
+
+        # Verifica se pelo menos 70% (4 de 5 ou 100%) das recomendadas são do gênero alvo
+        self.assertGreaterEqual(fracao, 0.70, f"Fração de {genero_alvo} foi {fracao:.1%}, esperava >= 70%")
+
 
 if __name__ == "__main__":
     unittest.main()

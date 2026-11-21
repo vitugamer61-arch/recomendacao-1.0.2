@@ -261,19 +261,23 @@ def etapa_6_recomendador(
     music_root: Path,
     mode: str = "cluster",
     gui: bool = True,
-    use_feedback: bool = True
+    use_feedback: bool = True,
+    zerar_feedback: bool = False
 ) -> None:
     """
     Etapa 6: Inicia o sistema de recomendação em primeiro plano.
     """
     fb_txt = "ativo" if use_feedback else "desativado (--sem-feedback)"
+    if zerar_feedback:
+        fb_txt += " (ZERADO)"
     logger.info(f"[6/6] Iniciando Recomendador Musical (Modo: '{mode}' | Feedback por Skip: {fb_txt})...")
     mpd_integration.run_recommender(
         metadata_path=config.METADATA_PATH,
         music_root=str(music_root),
         mode=mode,
         gui=gui,
-        use_feedback=use_feedback
+        use_feedback=use_feedback,
+        zerar_feedback=zerar_feedback
     )
 
 
@@ -283,6 +287,7 @@ def main():
     parser.add_argument("--recalcular", action="store_true", help="Força recálculo completo da clusterização K-Means do zero")
     parser.add_argument("--modo", type=str, choices=["refinado", "nao-supervisionado", "por-genero"], default="refinado", help="Modo de clusterização: refinado (padrão), nao-supervisionado, por-genero")
     parser.add_argument("--sem-feedback", action="store_true", help="Desativa feedback implícito por skip (baseline sem reforço)")
+    parser.add_argument("--zerar-feedback", action="store_true", help="Limpa todo o histórico de feedback.db antes de iniciar")
     parser.add_argument("--pureza-minima", type=float, default=0.80, help="Pureza mínima para parada de refinamento (padrão: 0.80)")
     parser.add_argument("--tamanho-minimo", type=int, default=15, help="Tamanho mínimo de cluster para refinamento (padrão: 15)")
     parser.add_argument("--profundidade-maxima", type=int, default=3, help="Profundidade máxima de refinamento recursivo (padrão: 3)")
@@ -418,7 +423,8 @@ def main():
             music_root=music_root,
             mode=rec_mode,
             gui=not args.no_gui,
-            use_feedback=not args.sem_feedback
+            use_feedback=not args.sem_feedback,
+            zerar_feedback=args.zerar_feedback
         )
 
     except KeyboardInterrupt:
