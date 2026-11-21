@@ -336,6 +336,190 @@ class TestFeedback(unittest.TestCase):
         # Verifica se pelo menos 70% (4 de 5 ou 100%) das recomendadas são do gênero alvo
         self.assertGreaterEqual(fracao, 0.70, f"Fração de {genero_alvo} foi {fracao:.1%}, esperava >= 70%")
 
+    def test_path_normalization_unquote_and_suffixes(self):
+        """Verifica unquote e remoção de sufixos (&time=..., ?cantata=...) após extensão de áudio."""
+        from feedback import clean_mpd_filepath
+        from mpd_integration import normalize_mpd_filepath
+
+        # 1. Cantata HTTP query string
+        url1 = "http://localhost:6600/?file=Rock%2Fbanda%201%2Fmusica1.mp3&cantata=1&time=120&id=42"
+        self.assertEqual(clean_mpd_filepath(url1), "Rock/banda 1/musica1.mp3")
+        self.assertEqual(normalize_mpd_filepath(url1), "Rock/banda 1/musica1.mp3")
+
+        # 2. Caminho relativo com sufixos MPD/Cantata
+        raw2 = "MPB/Chico%20Buarque%20-%20Construcao.flac&time=180&id=99&cantata=1"
+        self.assertEqual(clean_mpd_filepath(raw2), "MPB/Chico Buarque - Construcao.flac")
+        self.assertEqual(normalize_mpd_filepath(raw2), "MPB/Chico Buarque - Construcao.flac")
+
+        # 3. Caminho com extensão wav e query param
+        raw3 = "Sertanejo/Desbloqueado.wav?id=12"
+        self.assertEqual(clean_mpd_filepath(raw3), "Sertanejo/Desbloqueado.wav")
+        self.assertEqual(normalize_mpd_filepath(raw3), "Sertanejo/Desbloqueado.wav")
+
+    def test_regression_queue_ownership_and_purge_on_seed_change(self):
+        """Teste de regressão: sobras de decisão antiga são purgadas na troca de seed e top-1 fica em primeiro."""
+        from mpd_integration import (
+            mpd_add_recommendation_unified,
+            mpd_purge_pending_recommendations,
+            RECOMMENDER_SONGID_MAP
+        )
+
+        RECOMMENDER_SONGID_MAP.clear()
+
+        class MockMPDClient:
+            def __init__(self):
+                self.playlist = []
+                self.status_dict = {"state": "play", "song": 0}
+                self.next_id = 100
+
+            def playlistinfo(self):
+                return [dict(it) for it in self.playlist]
+
+            def status(self):
+                return dict(self.status_dict)
+
+            def currentsong(self):
+                pos = int(self.status_dict.get("song", 0))
+                for it in self.playlist:
+                    if int(it.get("pos", -1)) == pos:
+                        return dict(it)
+                return {}
+
+            def addid(self, uri, pos=None):
+                self.next_id += 1
+                sid = str(self.next_id)
+                if pos is not None and pos < len(self.playlist):
+                    self.playlist.insert(pos, {"id": sid, "file": uri, "pos": pos})
+                    for idx, it in enumerate(self.playlist):
+                        it["pos"] = idx
+                else:
+                    pos = len(self.playlist)
+                    self.playlist.append({"id": sid, "file": uri, "pos": pos})
+                return sid
+
+            def deleteid(self, songid):
+                sid_str = str(songid)
+                self.playlist = [it for it in self.playlist if it["id"] != sid_str]
+                for idx, it in enumerate(self.playlist):
+                    it["pos"] = idx
+
+        client = MockMPDClient()
+
+        # Cenário:
+        # Faixa 0: Tocando (Manual do usuário)
+        # Faixas 1 e 2: Sobras da Decisão Antiga #1
+        # Faixa 3: Manual do usuário aguardando na fila
+        client.playlist = [
+            {"id": "1", "file": "Gospel/Renato Vianna - 400 Primaveras.mp3", "pos": 0},
+            {"id": "2", "file": "Sertanejo/Diego & Victor Hugo - Desbloqueado.mp3", "pos": 1},
+            {"id": "3", "file": "Sertanejo/Outra_Sobra_Antiga.mp3", "pos": 2},
+            {"id": "4", "file": "MPB/Manual_Chico_Buarque.mp3", "pos": 3}
+        ]
+
+        # Registra propriedade das faixas antigas (Decisão #1)
+        self.storage.record_song_ownership(songid="2", decision_id=1, origem="recomendada", caminho=client.playlist[1]["file"])
+        self.storage.record_song_ownership(songid="3", decision_id=1, origem="exploracao", caminho=client.playlist[2]["file"])
+        RECOMMENDER_SONGID_MAP["2"] = {"decision_id": 1, "origem": "recomendada", "file": client.playlist[1]["file"]}
+        RECOMMENDER_SONGID_MAP["3"] = {"decision_id": 1, "origem": "exploracao", "file": client.playlist[2]["file"]}
+
+        # 1. Usuário troca manualmente para outra faixa ou pula
+        # A faixa atual no player passa a ser a pos 0
+        client.status_dict["song"] = 0
+
+        # Purga faixas pendentes da decisão antiga
+        purged = mpd_purge_pending_recommendations(
+            client=client,
+            current_pos=0,
+            reason="troca de seed / faixa alterada",
+            feedback_storage=self.storage
+        )
+
+        self.assertEqual(purged, 2, "Deveria ter purgado exatamente as 2 sobras antigas")
+
+        # Verifica que sobrou apenas a faixa tocando (pos 0) e a manual do usuário
+        files_restantes = [it["file"] for it in client.playlist]
+        self.assertIn("Gospel/Renato Vianna - 400 Primaveras.mp3", files_restantes)
+        self.assertIn("MPB/Manual_Chico_Buarque.mp3", files_restantes)
+        self.assertNotIn("Sertanejo/Diego & Victor Hugo - Desbloqueado.mp3", files_restantes)
+        self.assertNotIn("Sertanejo/Outra_Sobra_Antiga.mp3", files_restantes)
+
+        # 2. Agora o recomendador gera a Decisão #2 e adiciona o top-1 logo após a faixa atual
+        current_pos = int(client.status().get("song", 0))
+        top1_file = "Rock/3 Doors Down - Here Without You.mp3"
+        insert_pos = current_pos + 1
+
+        top1_sid = mpd_add_recommendation_unified(
+            client=client,
+            file_path=top1_file,
+            position=insert_pos,
+            decision_id=2,
+            origem="recomendada",
+            feedback_storage=self.storage
+        )
+
+        # 3. Verifica a ordem da fila:
+        # Pos 0: Faixa atual
+        # Pos 1: Top-1 da Decisão Atual (Here Without You)
+        # Pos 2: Faixa manual do usuário (empurrada para trás sem ser deletada)
+        self.assertEqual(client.playlist[0]["file"], "Gospel/Renato Vianna - 400 Primaveras.mp3")
+        self.assertEqual(client.playlist[1]["file"], "Rock/3 Doors Down - Here Without You.mp3")
+        self.assertEqual(client.playlist[2]["file"], "MPB/Manual_Chico_Buarque.mp3")
+
+        # Ownership do top-1 devidamente registrado com a nova decisão #2
+        own = self.storage.get_song_ownership(top1_sid)
+        self.assertIsNotNone(own)
+        self.assertEqual(own["decision_id"], 2)
+        self.assertEqual(own["origem"], "recomendada")
+
+    def test_sync_mpd_queue_state_statuses(self):
+        """Verifica status Tocada, Tocando e Na fila na sincronização com feedback.db."""
+        from mpd_integration import sync_mpd_queue_state, RECOMMENDER_SONGID_MAP
+
+        RECOMMENDER_SONGID_MAP.clear()
+
+        class MockMPDClient:
+            def playlistinfo(self):
+                return [
+                    {"id": "1", "file": "musica_ja_tocada.mp3", "pos": 0},
+                    {"id": "2", "file": "musica_tocando_agora.mp3", "pos": 1},
+                    {"id": "3", "file": "musica_na_fila_rec.mp3", "pos": 2},
+                    {"id": "4", "file": "musica_na_fila_manual.mp3", "pos": 3}
+                ]
+            def status(self):
+                return {"song": 1, "state": "play"}
+            def currentsong(self):
+                return {"id": "2", "file": "musica_tocando_agora.mp3", "pos": 1}
+
+        self.storage.record_song_ownership(songid="3", decision_id=10, origem="recomendada", caminho="musica_na_fila_rec.mp3")
+        RECOMMENDER_SONGID_MAP["3"] = {"decision_id": 10, "origem": "recomendada", "file": "musica_na_fila_rec.mp3"}
+
+        client = MockMPDClient()
+        file_to_id = {"musica_tocando_agora.mp3": "id_2"}
+        mock_col = MockCollection()
+
+        sync_mpd_queue_state(client, file_to_id, mock_col, "", self.storage)
+
+        q_state = self.storage.get_queue_state()
+        self.assertEqual(len(q_state), 4)
+
+        # Pos 0: Tocada
+        self.assertEqual(q_state[0]["status_fila"], "Tocada")
+        self.assertFalse(q_state[0]["is_current"])
+
+        # Pos 1: Tocando
+        self.assertEqual(q_state[1]["status_fila"], "Tocando")
+        self.assertTrue(q_state[1]["is_current"])
+
+        # Pos 2: Na fila (origem recomendada com decision_id)
+        self.assertEqual(q_state[2]["status_fila"], "Na fila")
+        self.assertEqual(q_state[2]["origem"], "recomendada")
+        self.assertEqual(q_state[2]["decision_id"], 10)
+
+        # Pos 3: Na fila (origem manual)
+        self.assertEqual(q_state[3]["status_fila"], "Na fila")
+        self.assertEqual(q_state[3]["origem"], "manual")
+        self.assertIsNone(q_state[3]["decision_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

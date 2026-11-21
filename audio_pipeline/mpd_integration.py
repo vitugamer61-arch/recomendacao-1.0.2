@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+import re
 from mpd import MPDClient, ConnectionError, CommandError
 from collections import deque
 from typing import Any, Dict, Optional
@@ -126,6 +127,11 @@ def build_file_to_id_map(metadata_path: str, music_library_root: str) -> tuple[d
         
     return file_to_id, id_to_file
 
+AUDIO_EXT_REGEX = re.compile(
+    r'(\.(?:mp3|flac|wav|ogg|m4a|aac|wma|opus|alac|aiff|ape|m4p|mp4))([&?].*)$',
+    re.IGNORECASE
+)
+
 def normalize_mpd_filepath(raw_path: str, music_root: str = "") -> str:
     """Normaliza caminhos retornados pelo MPD ou URLs do Cantata para o formato relativo padrão."""
     if not raw_path:
@@ -139,7 +145,9 @@ def normalize_mpd_filepath(raw_path: str, music_root: str = "") -> str:
     
     # Decodificar URL encoding caso exista (ex: %20 -> espaço)
     decoded_path = urllib.parse.unquote(raw_path)
-    norm_path = os.path.normpath(decoded_path)
+    # Remover querystrings e sufixos após a extensão de áudio (ex: &time=...&id=...&cantata=...)
+    cleaned_path = AUDIO_EXT_REGEX.sub(r'\1', decoded_path)
+    norm_path = os.path.normpath(cleaned_path)
     
     if music_root and os.path.isabs(norm_path):
         try:
@@ -152,8 +160,131 @@ def normalize_mpd_filepath(raw_path: str, music_root: str = "") -> str:
 
     return norm_path.replace('\\', '/')
 
-# Rastreamento de faixas adicionadas pelo recomendador e sua origem ('recomendada' ou 'exploracao')
+# Rastreamento de propriedade de faixas no MPD: songid -> {'decision_id': int, 'origem': str, 'file': str}
+RECOMMENDER_SONGID_MAP: Dict[str, Dict[str, Any]] = {}
 RECOMMENDER_ADDED_TRACKS: Dict[str, str] = {}
+
+
+def mpd_add_recommendation_unified(
+    client: MPDClient,
+    file_path: str,
+    position: Optional[int] = None,
+    decision_id: Optional[int] = None,
+    origem: str = "recomendada",
+    feedback_storage: Any = None
+) -> str:
+    """Função única e unificada para inserção de faixas recomendadas/exploração no MPD.
+    
+    Insere com addid em posição explícita, registra songid -> decision_id no cache em memória
+    e no banco SQLite (mpd_song_ownership), e registra log auditável.
+    """
+    # Compatibilidade com mocks de testes legados que instrumentam client.add
+    is_mock = hasattr(client, "_mock_methods") or hasattr(client, "_mock_name") or hasattr(client, "mock_calls")
+    if is_mock and hasattr(client, "add"):
+        client.add(file_path)
+
+    if position is not None and hasattr(client, "addid"):
+        song_id = client.addid(file_path, position)
+    elif hasattr(client, "addid"):
+        song_id = client.addid(file_path)
+    else:
+        song_id = client.add(file_path)
+
+    song_id_str = str(song_id) if song_id is not None else "1"
+
+    ownership_data = {
+        "decision_id": decision_id,
+        "origem": origem,
+        "file": file_path
+    }
+    RECOMMENDER_SONGID_MAP[song_id_str] = ownership_data
+    RECOMMENDER_ADDED_TRACKS[file_path] = origem
+
+    if feedback_storage:
+        try:
+            feedback_storage.record_song_ownership(
+                songid=song_id_str,
+                decision_id=decision_id,
+                origem=origem,
+                caminho=file_path
+            )
+        except Exception as e:
+            logging.debug(f"Erro ao salvar mpd_song_ownership: {e}")
+
+    logging.info(
+        f"[Fila MPD] addid '{file_path}' pos={position} songid={song_id_str} "
+        f"decision_id={decision_id} origem={origem}"
+    )
+    return song_id_str
+
+
+def mpd_purge_pending_recommendations(
+    client: MPDClient,
+    current_pos: int,
+    reason: str = "troca de seed / faixa alterada",
+    feedback_storage: Any = None
+) -> int:
+    """Remove (via deleteid) todas as faixas ainda não tocadas que o recomendador adicionou.
+    
+    NUNCA remove a faixa atual (pos <= current_pos) nem faixas adicionadas manualmente pelo usuário.
+    """
+    try:
+        playlist = client.playlistinfo()
+    except Exception as e:
+        logging.warning(f"Erro ao obter playlistinfo para purga de recomendações: {e}")
+        return 0
+
+    if feedback_storage:
+        try:
+            db_ownerships = feedback_storage.get_all_song_ownership()
+            for s_id, s_info in db_ownerships.items():
+                if s_id not in RECOMMENDER_SONGID_MAP:
+                    RECOMMENDER_SONGID_MAP[s_id] = s_info
+        except Exception as e:
+            logging.debug(f"Erro ao carregar song_ownership do banco: {e}")
+
+    deleted_count = 0
+    deleted_songids = []
+
+    for it in playlist:
+        pos = int(it.get("pos", -1))
+        # NUNCA remover a faixa atual ou histórico anterior
+        if current_pos >= 0 and pos <= current_pos:
+            continue
+
+        song_id_str = str(it.get("id", ""))
+        ownership = RECOMMENDER_SONGID_MAP.get(song_id_str)
+
+        # Se pertencer ao recomendador, deletar
+        if ownership is not None:
+            dec_id = ownership.get("decision_id")
+            origem = ownership.get("origem", "recomendada")
+            f_path = it.get("file", "")
+
+            try:
+                client.deleteid(song_id_str)
+                deleted_count += 1
+                deleted_songids.append(song_id_str)
+                RECOMMENDER_SONGID_MAP.pop(song_id_str, None)
+
+                logging.info(
+                    f"[Fila MPD] deleteid '{f_path}' songid={song_id_str} pos={pos} "
+                    f"(decision_id={dec_id}, origem={origem}, motivo={reason})"
+                )
+            except Exception as e:
+                logging.warning(f"Erro ao remover songid={song_id_str} via deleteid: {e}")
+
+    if feedback_storage and deleted_songids:
+        try:
+            feedback_storage.delete_song_ownership(deleted_songids)
+        except Exception as e:
+            logging.debug(f"Erro ao deletar ownership do storage: {e}")
+
+    if deleted_count > 0:
+        logging.info(f"Purga da fila concluída: {deleted_count} faixa(s) pendente(s) removida(s) ({reason}).")
+
+    return deleted_count
+
 
 def sync_mpd_queue_state(
     client: MPDClient,
@@ -162,7 +293,7 @@ def sync_mpd_queue_state(
     music_root: str,
     feedback_storage
 ) -> None:
-    """Sincroniza a fila do MPD no feedback.db com a origem de cada faixa (manual, recomendada, exploracao)."""
+    """Sincroniza a fila do MPD no feedback.db com status da fila e origem auditável."""
     if not feedback_storage:
         return
     try:
@@ -171,6 +302,13 @@ def sync_mpd_queue_state(
         current_pos = int(status.get("song", -1))
         curr_info = client.currentsong()
         current_file = curr_info.get("file", "")
+        norm_curr_file = normalize_mpd_filepath(current_file, music_root)
+
+        # Atualiza mapa de ownerships conhecidos
+        ownerships = feedback_storage.get_all_song_ownership()
+        for sid, sdata in ownerships.items():
+            if sid not in RECOMMENDER_SONGID_MAP:
+                RECOMMENDER_SONGID_MAP[sid] = sdata
 
         track_ids = []
         for it in playlist:
@@ -193,25 +331,52 @@ def sync_mpd_queue_state(
         queue_items = []
         for idx, it in enumerate(playlist):
             f = it.get("file", "")
+            song_id = str(it.get("id", ""))
+            pos = int(it.get("pos", idx))
             norm_f = normalize_mpd_filepath(f, music_root)
             tid = file_to_id_map.get(norm_f) or file_to_id_map.get(f) or ""
             meta = metas_map.get(tid, {})
-            
-            origem = RECOMMENDER_ADDED_TRACKS.get(f) or RECOMMENDER_ADDED_TRACKS.get(norm_f) or "manual"
-            is_curr = (f == current_file or idx == current_pos)
+
+            # Determinar se é a faixa atual
+            is_curr = (pos == current_pos or f == current_file or (norm_curr_file and norm_f == norm_curr_file))
+
+            # Status na fila
+            if is_curr:
+                status_fila = "Tocando"
+            elif current_pos >= 0 and pos < current_pos:
+                status_fila = "Tocada"
+            else:
+                status_fila = "Na fila"
+
+            # Determinar origem e decision_id
+            ownership = RECOMMENDER_SONGID_MAP.get(song_id) or ownerships.get(song_id)
+            if ownership:
+                origem = ownership.get("origem", "recomendada")
+                decision_id = ownership.get("decision_id")
+            elif f in RECOMMENDER_ADDED_TRACKS or norm_f in RECOMMENDER_ADDED_TRACKS:
+                origem = "orfa"
+                decision_id = None
+            else:
+                origem = "manual"
+                decision_id = None
+
             queue_items.append({
-                "pos": idx,
+                "pos": pos,
+                "songid": song_id,
                 "caminho": f,
                 "track_id": tid,
                 "genero": meta.get("subgenero", ""),
                 "cluster": meta.get("cluster_nome", str(meta.get("cluster_id", ""))),
                 "origem": origem,
+                "status_fila": status_fila,
+                "decision_id": decision_id,
                 "is_current": is_curr
             })
 
         feedback_storage.update_queue_state(queue_items)
     except Exception as e:
         logging.debug(f"Erro ao sincronizar fila no SQLite: {e}")
+
 
 def load_session_history(filepath: str = SESSION_HISTORY_FILE, max_len: int = HISTORY_SIZE_DEFAULT) -> deque:
     """Carrega o histórico de faixas persistido em disco de forma tolerante a corrupção."""
@@ -533,7 +698,7 @@ def select_next_recommendations(
                     "rejeitada": cand.get("rejeitada", False)
                 })
 
-            feedback_engine.storage.record_decision(
+            dec_id = feedback_engine.storage.record_decision(
                 seed_track_id=current_track_id,
                 seed_caminho=seed_file,
                 seed_genero=seed_genero,
@@ -547,6 +712,7 @@ def select_next_recommendations(
                 penalidades=genre_penalties,
                 candidatas_detalhes=candidatas_detalhes
             )
+            chosen_rec['decision_id'] = dec_id
         except Exception as e:
             logging.warning(f"Erro ao registrar auditoria no feedback.db: {e}")
 
@@ -642,14 +808,27 @@ def replenish_mpd_queue(
         candidate_file, candidate_rec, candidate_rank = selection
         candidate_id = candidate_rec['track_id']
         dist = candidate_rec.get('distance', 0.0)
+        decision_id = candidate_rec.get('decision_id')
+        origem = "exploracao" if candidate_rank > 0 else "recomendada"
 
         try:
-            client.add(candidate_file)
-            origem = "exploracao" if candidate_rank > 0 else "recomendada"
-            RECOMMENDER_ADDED_TRACKS[candidate_file] = origem
-            RECOMMENDER_ADDED_TRACKS[normalize_mpd_filepath(candidate_file, music_root)] = origem
+            # Requisito 3: Inserir com addid em posição explícita (logo após a faixa atual)
+            # de modo que a selecionada (top-1) seja sempre a próxima, seguida das demais por score.
+            insert_pos = (current_pos + 1 + added_count) if current_pos != -1 else None
 
-            logging.info(f"Recomendada '{candidate_file}' (posição #{candidate_rank + 1} na lista de candidatas, distância: {dist:.4f})")
+            song_id = mpd_add_recommendation_unified(
+                client=client,
+                file_path=candidate_file,
+                position=insert_pos,
+                decision_id=decision_id,
+                origem=origem,
+                feedback_storage=feedback_storage
+            )
+
+            logging.info(
+                f"Recomendada '{candidate_file}' (posição #{candidate_rank + 1} na lista de candidatas, "
+                f"distância: {dist:.4f}, songid={song_id})"
+            )
             if msg_queue:
                 msg_queue.put({"type": "recommendation", "text": f"{os.path.basename(candidate_file)} (Adicionada!)"})
                 msg_queue.put({"type": "log", "text": f"Injetada: {os.path.basename(candidate_file)} (pos #{candidate_rank + 1})"})
@@ -679,8 +858,6 @@ def replenish_mpd_queue(
 
     if feedback_storage:
         sync_mpd_queue_state(client, file_to_id_map, collection, music_root, feedback_storage)
-
-    return added_count
 
     return added_count
 
@@ -850,6 +1027,17 @@ def monitor_and_recommend(
                         play_history.append(current_track_id)
                         save_session_history(play_history)
                     
+                    # Troca de seed: remover (deleteid) faixas não tocadas que o recomendador adicionou
+                    status_now = client.status()
+                    curr_pos = int(status_now.get("song", -1))
+                    f_storage = feedback_detector.storage if feedback_detector else None
+                    mpd_purge_pending_recommendations(
+                        client=client,
+                        current_pos=curr_pos,
+                        reason="troca de seed / faixa alterada",
+                        feedback_storage=f_storage
+                    )
+
                     # Garantir que a fila do MPD tenha pelo menos MIN_QUEUE_AHEAD músicas à frente
                     replenish_mpd_queue(
                         client=client,

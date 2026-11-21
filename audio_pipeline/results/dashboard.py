@@ -230,8 +230,19 @@ def render_live_tab():
         st.subheader("🎵 Faixa em Reprodução")
         if current_track:
             origem = current_track.get("origem", "manual")
-            badge_color = "#2ecc71" if origem == "recomendada" else "#9b59b6" if origem == "exploracao" else "#95a5a6"
-            origem_label = "Recomendada (#1)" if origem == "recomendada" else "Exploração (Top-N)" if origem == "exploracao" else "Manual (Usuário)"
+            d_id = current_track.get("decision_id")
+            if origem == "recomendada":
+                badge_color = "#2ecc71"
+                origem_label = f"Recomendada #{d_id} (#1)" if d_id is not None else "Recomendada (#1)"
+            elif origem == "exploracao":
+                badge_color = "#9b59b6"
+                origem_label = f"Exploração #{d_id} (Top-N)" if d_id is not None else "Exploração (Top-N)"
+            elif origem == "orfa":
+                badge_color = "#e67e22"
+                origem_label = "⚠️ Órfã (sem decisão)"
+            else:
+                badge_color = "#95a5a6"
+                origem_label = "Manual (Usuário)"
             
             st.markdown(f"""
             <div style="background: #1e2130; border-radius: 10px; padding: 18px; border-left: 5px solid {badge_color};">
@@ -253,269 +264,41 @@ def render_live_tab():
     with col_queue:
         st.subheader("📜 Fila Atual do MPD")
         if queue_items:
+            def format_origem(it):
+                orig = it.get("origem", "manual")
+                item_dec_id = it.get("decision_id")
+                if orig == "recomendada":
+                    return f"🟢 Decisão #{item_dec_id} (Recomendada)" if item_dec_id is not None else "🟢 Recomendada"
+                elif orig == "exploracao":
+                    return f"🟣 Decisão #{item_dec_id} (Exploração)" if item_dec_id is not None else "🟣 Exploração"
+                elif orig == "orfa":
+                    return "⚠️ Órfã (sem decisão)"
+                return "⚪ Manual"
+
+            def format_status(it):
+                st_fila = it.get("status_fila")
+                if it.get("is_current") or st_fila == "Tocando":
+                    return "▶️ Tocando"
+                elif st_fila == "Tocada":
+                    return "⏮️ Tocada"
+                return "⏳ Na fila"
+
             df_q = pd.DataFrame([
                 {
                     "Pos": it.get("pos", 0) + 1,
-                    "Status": "▶ Tocando" if it.get("is_current") else "Aguardando",
+                    "Status": format_status(it),
                     "Faixa": os.path.basename(it.get("caminho", "")),
                     "Gênero": it.get("genero") or "—",
                     "Cluster": it.get("cluster") or "—",
-                    "Origem": "🟢 Recomendada" if it.get("origem") == "recomendada" else "🟣 Exploração" if it.get("origem") == "exploracao" else "⚪ Manual"
+                    "Origem": format_origem(it)
                 }
                 for it in queue_items
             ])
-            st.dataframe(df_q, use_container_width=True, hide_index=True, height=210)
-        else:
-            st.info("Fila do MPD vazia ou aguardando leitura do estado.")
+            st.dataframe(df_q, use_container_width=True, hide_index=True, height=230)
 
-    st.markdown("---")
-
-    # 2. Métricas de Aceitação e Cooldown (Cards)
-    stats_geral = storage.get_acceptance_stats()
-    stats_10m = storage.get_acceptance_stats(window_seconds=600.0)
-    cooldown_genres = storage.get_cooldown_genres()
-
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.markdown(f"""
-        <div class="metric-card ganho">
-            <div class="metric-label">Taxa de Aceitação Global</div>
-            <div class="metric-value">{stats_geral['taxa_aceitacao']:.1%}</div>
-            <div class="small-note">{stats_geral['total_aceitas']} aceitas / {stats_geral['total_skips']} skips</div>
-        </div>""", unsafe_allow_html=True)
-
-    with m2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Taxa Recente (Últimos 10 min)</div>
-            <div class="metric-value">{stats_10m['taxa_aceitacao']:.1%}</div>
-            <div class="small-note">{stats_10m['total_aceitas']} aceitas / {stats_10m['total_skips']} skips</div>
-        </div>""", unsafe_allow_html=True)
-
-    with m3:
-        st.markdown(f"""
-        <div class="metric-card baseline">
-            <div class="metric-label">Total de Skips (<30s)</div>
-            <div class="metric-value">{stats_geral['total_skips']}</div>
-            <div class="small-note">{stats_geral['total_parciais']} parciais (+fraco)</div>
-        </div>""", unsafe_allow_html=True)
-
-    with m4:
-        cd_count = len(cooldown_genres)
-        cd_color = "#e74c3c" if cd_count > 0 else "#2ecc71"
-        cd_text = ", ".join(cooldown_genres) if cooldown_genres else "Nenhum gênero bloqueado"
-        st.markdown(f"""
-        <div class="metric-card" style="border-left-color: {cd_color};">
-            <div class="metric-label">Gêneros em Cooldown (Filtro Ativo)</div>
-            <div class="metric-value" style="color: {cd_color}; font-size: 1.35rem;">{cd_count} ativo(s)</div>
-            <div class="small-note">{cd_text}</div>
-        </div>""", unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # 3. Penalidades de Gênero & Feed de Eventos
-    col_pen, col_feed = st.columns([1, 1.2])
-
-    with col_pen:
-        st.subheader("⚖️ Penalidades por Gênero (Tempo Real)")
-        genre_penalties = storage.get_genre_penalties()
-        if genre_penalties:
-            df_pen = pd.DataFrame([
-                {"Gênero": g, "Penalidade": pen}
-                for g, pen in genre_penalties.items()
-            ]).sort_values("Penalidade", ascending=True)
-
-            fig_pen = go.Figure()
-            fig_pen.add_trace(go.Bar(
-                y=df_pen["Gênero"],
-                x=df_pen["Penalidade"],
-                orientation="h",
-                marker=dict(
-                    color=df_pen["Penalidade"],
-                    colorscale="Reds",
-                    cmin=0.0,
-                    cmax=max(df_pen["Penalidade"].max(), 2.0)
-                ),
-                text=df_pen["Penalidade"].map(lambda x: f"{x:.2f}"),
-                textposition="auto"
-            ))
-            fig_pen.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="#0e1117",
-                plot_bgcolor="#1a1a2e",
-                xaxis_title="Penalidade (com decaimento temporal contínuo)",
-                margin=dict(l=20, r=20, t=30, b=30),
-                height=290
-            )
-            st.plotly_chart(fig_pen, use_container_width=True)
-        else:
-            st.info("Nenhuma penalidade de gênero registrada no momento.")
-
-    with col_feed:
-        st.subheader("⏱️ Feed Cronológico de Eventos")
-        recent_events = storage.get_recent_events(limit=8)
-        last_decision = storage.get_last_decision()
-
-        feed_rows = []
-        for ev in recent_events:
-            tipo = ev.get("tipo", "")
-            g = ev.get("genero") or "Sem gênero"
-            musica = os.path.basename(ev.get("caminho") or ev.get("track_id") or "")
-            t_str = str(ev.get("timestamp", ""))[-8:]
-            elap = float(ev.get("elapsed") or 0.0)
-
-            if tipo == "completa":
-                feed_rows.append({
-                    "Hora": t_str,
-                    "Ícone": "🟢",
-                    "Tipo": "ACEITA (≥80%)",
-                    "Faixa": musica,
-                    "Detalhes": f"{g} · {elap:.0f}s ouvida"
-                })
-            elif tipo == "parcial":
-                peso = float(ev.get("peso") or 0.5)
-                feed_rows.append({
-                    "Hora": t_str,
-                    "Ícone": "🟡",
-                    "Tipo": f"PARCIAL (+{peso:.2f})",
-                    "Faixa": musica,
-                    "Detalhes": f"{g} · {elap:.0f}s ouvida"
-                })
-            elif tipo == "skip":
-                feed_rows.append({
-                    "Hora": t_str,
-                    "Ícone": "🔴",
-                    "Tipo": "SKIP (<30s)",
-                    "Faixa": musica,
-                    "Detalhes": f"{g} · {elap:.0f}s pulada"
-                })
-
-        if last_decision and last_decision.get("candidatas"):
-            for c in last_decision["candidatas"]:
-                if c.get("rejeitada"):
-                    feed_rows.append({
-                        "Hora": str(last_decision.get("timestamp", ""))[-8:],
-                        "Ícone": "⚠️",
-                        "Tipo": "FILTRADA",
-                        "Faixa": c.get("filename", ""),
-                        "Detalhes": c.get("motivo", "Filtro de exclusão")
-                    })
-
-        if feed_rows:
-            df_feed = pd.DataFrame(feed_rows)
-            st.dataframe(df_feed, use_container_width=True, hide_index=True, height=290)
-        else:
-            st.info("Nenhum evento registrado no histórico recente.")
-
-    st.markdown("---")
-
-    # 4. Tabela da Última Decisão do Recomendador
-    st.subheader("🎯 Detalhamento da Última Decisão do Recomendador")
-    last_dec = storage.get_last_decision()
-    if last_dec:
-        seed_f = last_dec.get("seed_caminho") or last_dec.get("seed_track_id", "")
-        seed_nome = os.path.basename(seed_f) if seed_f else "—"
-        escolhida_f = last_dec.get("escolhida_caminho") or ""
-        escolhida_nome = os.path.basename(escolhida_f) if escolhida_f else "—"
-        origem_dec = last_dec.get("origem", "recomendada")
-        rank_dec = last_dec.get("rank_escolhido", 0) + 1
-
-        st.markdown(
-            f"📍 **Seed:** `{seed_nome}` ({last_dec.get('seed_genero')}) &nbsp;|&nbsp; "
-            f"🏆 **Escolhida:** `{escolhida_nome}` ({last_dec.get('escolhida_genero')}) &nbsp;|&nbsp; "
-            f"🏷️ **Origem:** `{origem_dec.upper()}` (Rank #{rank_dec}) &nbsp;|&nbsp; "
-            f"⭐ **Score:** `{last_dec.get('score_escolhido', 0.0):.4f}` &nbsp;|&nbsp; "
-            f"🕒 **Horário:** `{str(last_dec.get('timestamp', ''))}`"
-        )
-
-        cands = last_dec.get("candidatas", [])
-        if cands:
-            df_cands = pd.DataFrame([
-                {
-                    "Rank": c.get("rank", 0),
-                    "Status": "🏆 Selecionada" if c.get("motivo") == "Selecionada" else "🚫 Rejeitada" if c.get("rejeitada") else "Alternativa",
-                    "Faixa": c.get("filename", ""),
-                    "Gênero": c.get("subgenero", ""),
-                    "Cluster": c.get("cluster_nome", ""),
-                    "Similaridade (q)": f"{c.get('sim_query', 0.0):.3f}",
-                    "Pen. Faixa (λ)": f"{c.get('track_penalty', 0.0):.3f}",
-                    "Pen. Gênero (μ)": f"{c.get('genre_penalty', 0.0):.3f}",
-                    "Score Final": f"{c.get('final_score', 0.0):.3f}",
-                    "Motivo / Decisão": c.get("motivo", "")
-                }
-                for c in cands
-            ])
-            st.dataframe(df_cands, use_container_width=True, hide_index=True)
-    else:
-        st.info("Aguardando primeira decisão do recomendador...")
-
-
-def render_precision_tab():
-    # ══════════════════════════════════════════════════════════════════════════════
-    # SEÇÃO 1: PRECISÃO & RECOMENDAÇÃO (P@K GLOBAL VS RESTRICTED AO CLUSTER)
-    # ══════════════════════════════════════════════════════════════════════════════
-    st.header(f"🎯 Precisão@K (K = {k_selecionado})")
-
-    if not FEEDBACK_DB.exists():
-        st.info("ℹ️ Banco de dados `feedback.db` ainda não criado. Inicie o recomendador pelo `iniciar.bat` para iniciar o rastreamento em tempo real.")
-        return
-
-    storage = feedback.FeedbackStorage(db_path=FEEDBACK_DB)
-
-    # Barra superior de ações
-    col_hdr, col_btn = st.columns([4, 1.2])
-    with col_hdr:
-        st.caption("Atualização automática a cada ~2 segundos via SQLite WAL. Monitore decisões, histórico de skips e fila ativa.")
-    with col_btn:
-        if st.button("🗑️ Zerar Feedback", use_container_width=True, key="btn_zerar_fb_top"):
-            storage.clear_history()
-            st.success("Histórico de feedback limpo com sucesso!")
-            st.rerun()
-
-    # 1. Faixa atual e Fila do MPD
-    queue_items = storage.get_queue_state()
-    current_track = next((it for it in queue_items if it.get("is_current")), None)
-
-    col_curr, col_queue = st.columns([1, 1.8])
-    with col_curr:
-        st.subheader("🎵 Faixa em Reprodução")
-        if current_track:
-            origem = current_track.get("origem", "manual")
-            badge_color = "#2ecc71" if origem == "recomendada" else "#9b59b6" if origem == "exploracao" else "#95a5a6"
-            origem_label = "Recomendada (#1)" if origem == "recomendada" else "Exploração (Top-N)" if origem == "exploracao" else "Manual (Usuário)"
-            
-            st.markdown(f"""
-            <div style="background: #1e2130; border-radius: 10px; padding: 18px; border-left: 5px solid {badge_color};">
-                <div style="font-size: 1.15rem; font-weight: bold; color: #ffffff;">{os.path.basename(current_track.get('caminho', ''))}</div>
-                <div style="margin-top: 10px; color: #bbbbbb; font-size: 0.92rem; line-height: 1.6;">
-                    <b>Subgênero:</b> <span style="color: #ffffff;">{current_track.get('genero') or '—'}</span><br>
-                    <b>Cluster:</b> <span style="color: #ffffff;">{current_track.get('cluster') or '—'}</span><br>
-                    <b>Origem:</b> <span style="background: {badge_color}; color: #ffffff; padding: 3px 8px; border-radius: 4px; font-weight: bold; font-size: 0.8rem;">{origem_label}</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div style="background: #1e2130; border-radius: 10px; padding: 18px; border-left: 5px solid #7f8c8d;">
-                <div style="color: #888888;">Nenhuma faixa em reprodução ativa no MPD.</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-    with col_queue:
-        st.subheader("📜 Fila Atual do MPD")
-        if queue_items:
-            df_q = pd.DataFrame([
-                {
-                    "Pos": it.get("pos", 0) + 1,
-                    "Status": "▶ Tocando" if it.get("is_current") else "Aguardando",
-                    "Faixa": os.path.basename(it.get("caminho", "")),
-                    "Gênero": it.get("genero") or "—",
-                    "Cluster": it.get("cluster") or "—",
-                    "Origem": "🟢 Recomendada" if it.get("origem") == "recomendada" else "🟣 Exploração" if it.get("origem") == "exploracao" else "⚪ Manual"
-                }
-                for it in queue_items
-            ])
-            st.dataframe(df_q, use_container_width=True, hide_index=True, height=210)
+            orfas = [it for it in queue_items if it.get("origem") == "orfa"]
+            if orfas:
+                st.warning(f"⚠️ Atenção: Detectada(s) {len(orfas)} faixa(s) órfã(s) na fila sem decisão associada!")
         else:
             st.info("Fila do MPD vazia ou aguardando leitura do estado.")
 

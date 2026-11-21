@@ -14,6 +14,8 @@ Implementa:
 
 import os
 import sys
+import re
+import urllib.parse
 import json
 import sqlite3
 import logging
@@ -33,6 +35,24 @@ import feedback_config as fcfg
 logger = logging.getLogger("FeedbackSystem")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+AUDIO_EXT_REGEX = re.compile(
+    r'(\.(?:mp3|flac|wav|ogg|m4a|aac|wma|opus|alac|aiff|ape|m4p|mp4))([&?].*)$',
+    re.IGNORECASE
+)
+
+def clean_mpd_filepath(raw_path: str) -> str:
+    """Aplica unquote e remove sufixos como &time=...&id=...&cantata=... após a extensão de áudio."""
+    if not raw_path:
+        return ""
+    if raw_path.startswith("http") and "?file=" in raw_path:
+        parsed_url = urllib.parse.urlparse(raw_path)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        if 'file' in query_params:
+            raw_path = query_params['file'][0]
+    decoded = urllib.parse.unquote(raw_path)
+    cleaned = AUDIO_EXT_REGEX.sub(r'\1', decoded)
+    return os.path.normpath(cleaned).replace('\\', '/')
 
 
 # ── 1. PERSISTÊNCIA SQLITE (FEEDBACK STORAGE) ────────────────────────────────
@@ -137,14 +157,29 @@ class FeedbackStorage:
             # Tabela de estado atual da fila do MPD (para monitor ao vivo)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS mpd_queue_state (
-                    pos INTEGER PRIMARY KEY,
+                    pos INTEGER,
+                    songid TEXT,
                     caminho TEXT,
                     track_id TEXT,
                     genero TEXT,
                     cluster TEXT,
-                    origem TEXT,              -- 'recomendada', 'exploracao', 'manual'
+                    origem TEXT,              -- 'recomendada', 'exploracao', 'manual', 'orfa'
+                    decision_id INTEGER,
+                    status_fila TEXT,         -- 'Tocada', 'Tocando', 'Na fila'
                     is_current INTEGER DEFAULT 0,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (pos, songid)
+                )
+            """)
+
+            # Tabela de propriedade de faixas inseridas pelo recomendador no MPD (songid -> decision_id)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS mpd_song_ownership (
+                    songid TEXT PRIMARY KEY,
+                    decision_id INTEGER,
+                    origem TEXT,              -- 'recomendada', 'exploracao'
+                    caminho TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             conn.commit()
@@ -210,6 +245,51 @@ class FeedbackStorage:
             conn.commit()
             return cursor.lastrowid
 
+    def record_song_ownership(
+        self,
+        songid: str,
+        decision_id: int,
+        origem: str,
+        caminho: str = ""
+    ) -> None:
+        """Registra a propriedade de uma faixa na fila do MPD (songid -> decision_id, origem)."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO mpd_song_ownership (songid, decision_id, origem, caminho)
+                VALUES (?, ?, ?, ?)
+            """, (str(songid), decision_id, origem, caminho))
+            conn.commit()
+
+    def get_song_ownership(self, songid: str) -> Optional[Dict[str, Any]]:
+        """Recupera o registro de propriedade de um songid."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM mpd_song_ownership WHERE songid = ?", (str(songid),))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_all_song_ownership(self) -> Dict[str, Dict[str, Any]]:
+        """Recupera todos os registros de propriedade da fila do MPD."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM mpd_song_ownership")
+            return {str(row["songid"]): dict(row) for row in cursor.fetchall()}
+
+    def delete_song_ownership(self, songids: Any) -> None:
+        """Remove registros de propriedade (quando faixas são removidas da fila)."""
+        if isinstance(songids, (str, int)):
+            songids = [str(songids)]
+        else:
+            songids = [str(s) for s in songids]
+        if not songids:
+            return
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            placeholders = ",".join("?" for _ in songids)
+            cursor.execute(f"DELETE FROM mpd_song_ownership WHERE songid IN ({placeholders})", songids)
+            conn.commit()
+
     def update_queue_state(self, items: List[Dict[str, Any]]) -> None:
         """Atualiza a visão espelhada da fila do MPD no banco de dados."""
         with self._get_connection() as conn:
@@ -217,15 +297,20 @@ class FeedbackStorage:
             cursor.execute("DELETE FROM mpd_queue_state")
             for it in items:
                 cursor.execute("""
-                    INSERT INTO mpd_queue_state (pos, caminho, track_id, genero, cluster, origem, is_current)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO mpd_queue_state (
+                        pos, songid, caminho, track_id, genero, cluster,
+                        origem, decision_id, status_fila, is_current
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     it.get("pos", 0),
+                    str(it.get("songid", "")),
                     it.get("caminho", ""),
                     it.get("track_id", ""),
                     it.get("genero", ""),
                     it.get("cluster", ""),
                     it.get("origem", "manual"),
+                    it.get("decision_id"),
+                    it.get("status_fila", "Na fila"),
                     1 if it.get("is_current") else 0
                 ))
             conn.commit()
@@ -486,6 +571,7 @@ class FeedbackStorage:
             cursor.execute("DELETE FROM feedback_events")
             cursor.execute("DELETE FROM decisoes")
             cursor.execute("DELETE FROM mpd_queue_state")
+            cursor.execute("DELETE FROM mpd_song_ownership")
             conn.commit()
         logger.info("[FEEDBACK ZERADO] Banco de dados de feedback foi totalmente limpo.")
 
@@ -554,7 +640,8 @@ class FeedbackDetector:
             return None
 
         ratio = elapsed / duration
-        prev_file = prev_song.get("file", "")
+        raw_prev_file = prev_song.get("file", "")
+        prev_file = clean_mpd_filepath(raw_prev_file)
 
         # Metadados da faixa
         subgenero = ""
@@ -766,7 +853,8 @@ class FeedbackEngine:
                 continue
 
             # 2. Filtro de exclusão: faixa já na fila
-            if c_file and (c_file in queued_files or os.path.basename(c_file) in queued_files):
+            c_file_clean = clean_mpd_filepath(c_file)
+            if c_file and (c_file in queued_files or c_file_clean in queued_files or os.path.basename(c_file) in queued_files):
                 motivo = "Rejeitada (já na fila)"
                 cand["motivo"] = motivo
                 cand["rejeitada"] = True
