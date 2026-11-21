@@ -6,6 +6,7 @@ import random
 import time
 from mpd import MPDClient, ConnectionError, CommandError
 from collections import deque
+from typing import Any, Dict, Optional
 import urllib.parse
 import threading
 import queue
