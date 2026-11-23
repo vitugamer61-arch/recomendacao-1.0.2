@@ -141,6 +141,8 @@ class FeedbackStorage:
                     seed_track_id TEXT,
                     seed_caminho TEXT,
                     seed_genero TEXT,
+                    seed_songid TEXT,
+                    gatilho TEXT DEFAULT 'player',
                     escolhida_track_id TEXT,
                     escolhida_caminho TEXT,
                     escolhida_genero TEXT,
@@ -153,6 +155,17 @@ class FeedbackStorage:
                 )
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_dec_time ON decisoes(timestamp)")
+
+            # Migração transparente de colunas para bancos existentes
+            try:
+                cursor.execute("PRAGMA table_info(decisoes)")
+                existing_cols = {row[1] for row in cursor.fetchall()}
+                if "seed_songid" not in existing_cols:
+                    cursor.execute("ALTER TABLE decisoes ADD COLUMN seed_songid TEXT")
+                if "gatilho" not in existing_cols:
+                    cursor.execute("ALTER TABLE decisoes ADD COLUMN gatilho TEXT DEFAULT 'player'")
+            except Exception:
+                pass
 
             # Tabela de estado atual da fila do MPD (para monitor ao vivo)
             cursor.execute("""
@@ -224,26 +237,54 @@ class FeedbackStorage:
         rank_escolhido: int,
         score_escolhido: float,
         penalidades: Dict[str, float],
-        candidatas_detalhes: List[Dict[str, Any]]
+        candidatas_detalhes: List[Dict[str, Any]],
+        seed_songid: str = "",
+        gatilho: str = "player"
     ) -> int:
         """Registra a auditoria completa de uma decisão de recomendação tomada."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
+
+            # Instrumentação: verificar e alertar caso haja mais de uma decisão para o mesmo seed (songid)
+            if seed_songid:
+                cursor.execute("SELECT COUNT(*) FROM decisoes WHERE seed_songid = ?", (str(seed_songid),))
+                qtd_anteriores = cursor.fetchone()[0]
+                if qtd_anteriores > 0:
+                    logger.warning(
+                        f"ALERTA: Mais de uma decisão registrada para o mesmo seed songid={seed_songid}! "
+                        f"(Decisões anteriores: {qtd_anteriores}, nova decisão agora: #{qtd_anteriores + 1})"
+                    )
+
             cursor.execute("""
                 INSERT INTO decisoes (
-                    seed_track_id, seed_caminho, seed_genero,
+                    seed_track_id, seed_caminho, seed_genero, seed_songid, gatilho,
                     escolhida_track_id, escolhida_caminho, escolhida_genero, escolhida_cluster,
                     origem, rank_escolhido, score_escolhido,
                     penalidades_json, candidatas_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                seed_track_id, seed_caminho, seed_genero,
+                seed_track_id, seed_caminho, seed_genero, str(seed_songid), str(gatilho),
                 escolhida_track_id, escolhida_caminho, escolhida_genero, escolhida_cluster,
                 origem, rank_escolhido, float(score_escolhido),
                 json.dumps(penalidades), json.dumps(candidatas_detalhes)
             ))
             conn.commit()
             return cursor.lastrowid
+
+    def get_duplicate_seed_decisions(self) -> List[Dict[str, Any]]:
+        """Retorna sementes (seed_songid) que tiveram mais de uma decisão associada."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT seed_songid, COUNT(*) as qtd, GROUP_CONCAT(id) as dec_ids
+                FROM decisoes
+                WHERE seed_songid IS NOT NULL AND seed_songid != ''
+                GROUP BY seed_songid
+                HAVING qtd > 1
+                ORDER BY qtd DESC
+            """)
+            return [{"seed_songid": row[0], "qtd": row[1], "decision_ids": row[2]} for row in cursor.fetchall()]
+
 
     def record_song_ownership(
         self,

@@ -288,6 +288,7 @@ def render_live_tab():
                     "Pos": it.get("pos", 0) + 1,
                     "Status": format_status(it),
                     "Faixa": os.path.basename(it.get("caminho", "")),
+                    "Decisão ID": f"#{it.get('decision_id')}" if it.get("decision_id") is not None else "—",
                     "Gênero": it.get("genero") or "—",
                     "Cluster": it.get("cluster") or "—",
                     "Origem": format_origem(it)
@@ -295,6 +296,12 @@ def render_live_tab():
                 for it in queue_items
             ])
             st.dataframe(df_q, use_container_width=True, hide_index=True, height=230)
+
+            # Alerta para duplicidade de decisões com o mesmo seed
+            dups = storage.get_duplicate_seed_decisions()
+            if dups:
+                msg_dup = ", ".join([f"songid={d['seed_songid']} ({d['qtd']} decisões: IDs {d['decision_ids']})" for d in dups[:3]])
+                st.warning(f"⚠️ Atenção: Detectada mais de uma decisão para o mesmo seed: {msg_dup}")
 
             orfas = [it for it in queue_items if it.get("origem") == "orfa"]
             if orfas:
@@ -447,15 +454,20 @@ def render_live_tab():
     st.subheader("🎯 Detalhamento da Última Decisão do Recomendador")
     last_dec = storage.get_last_decision()
     if last_dec:
+        dec_id = last_dec.get("id", "—")
         seed_f = last_dec.get("seed_caminho") or last_dec.get("seed_track_id", "")
         seed_nome = os.path.basename(seed_f) if seed_f else "—"
+        seed_songid = last_dec.get("seed_songid") or "—"
+        gatilho_dec = last_dec.get("gatilho") or "player"
         escolhida_f = last_dec.get("escolhida_caminho") or ""
         escolhida_nome = os.path.basename(escolhida_f) if escolhida_f else "—"
         origem_dec = last_dec.get("origem", "recomendada")
         rank_dec = last_dec.get("rank_escolhido", 0) + 1
 
         st.markdown(
-            f"📍 **Seed:** `{seed_nome}` ({last_dec.get('seed_genero')}) &nbsp;|&nbsp; "
+            f"🆔 **Decisão:** `#{dec_id}` &nbsp;|&nbsp; "
+            f"📍 **Seed:** `{seed_nome}` (songid={seed_songid}, gênero={last_dec.get('seed_genero')}) &nbsp;|&nbsp; "
+            f"⚡ **Gatilho:** `{gatilho_dec}` &nbsp;|&nbsp; "
             f"🏆 **Escolhida:** `{escolhida_nome}` ({last_dec.get('escolhida_genero')}) &nbsp;|&nbsp; "
             f"🏷️ **Origem:** `{origem_dec.upper()}` (Rank #{rank_dec}) &nbsp;|&nbsp; "
             f"⭐ **Score:** `{last_dec.get('score_escolhido', 0.0):.4f}` &nbsp;|&nbsp; "

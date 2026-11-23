@@ -145,11 +145,14 @@ class TestRecommendationLogic(unittest.TestCase):
             mock_client = MagicMock()
             # Fila tem a música atual (índice 0), 0 músicas à frente
             mock_client.status.return_value = {"song": "0", "state": "play"}
+            mock_client.currentsong.return_value = {"file": "rock/track_a.mp3", "id": "1"}
             mock_client.playlistinfo.side_effect = [
-                [{"file": "rock/track_a.mp3"}], # estado inicial: 0 à frente
-                [{"file": "rock/track_a.mp3"}, {"file": "rock/track_c.mp3"}], # após adicionar C: 1 à frente
-                [{"file": "rock/track_a.mp3"}, {"file": "rock/track_c.mp3"}, {"file": "rock/track_d.mp3"}] # após adicionar D: 2 à frente
+                [{"file": "rock/track_a.mp3", "id": "1", "pos": "0"}],                                              # purge interna
+                [{"file": "rock/track_a.mp3", "id": "1", "pos": "0"}],                                              # após purge: 0 à frente
+                [{"file": "rock/track_a.mp3", "id": "1", "pos": "0"}, {"file": "rock/track_c.mp3", "id": "2", "pos": "1"}],  # após adicionar C: 1 à frente
+                [{"file": "rock/track_a.mp3", "id": "1", "pos": "0"}, {"file": "rock/track_c.mp3", "id": "2", "pos": "1"}, {"file": "rock/track_d.mp3", "id": "3", "pos": "2"}] # após adicionar D: 2 à frente
             ]
+            mock_client.addid.side_effect = ["2", "3"]
 
             # B falha no add, mas C e D têm sucesso
             def mock_add(filepath):
@@ -173,7 +176,8 @@ class TestRecommendationLogic(unittest.TestCase):
                 failed_tracks=failed,
                 min_queue_ahead=2,
                 max_tries=5,
-                selection_mode="first"
+                selection_mode="first",
+                use_feedback=False
             )
 
             # B falhou e foi parar em failed_tracks
@@ -224,11 +228,14 @@ class TestRecommendationLogic(unittest.TestCase):
 
             mock_client = MagicMock()
             mock_client.status.return_value = {"song": "-1", "state": "stop"}
+            mock_client.currentsong.return_value = {}
             mock_client.playlistinfo.side_effect = [
-                [], # vazia
-                [{"file": "rock/track_b.mp3"}],
-                [{"file": "rock/track_b.mp3"}, {"file": "rock/track_c.mp3"}]
+                [],  # purge interna (fila vazia, nada a purgar)
+                [],  # após purge: fila vazia, ahead = 0
+                [{"file": "rock/track_b.mp3", "id": "1", "pos": "0"}],  # após adicionar B: 1 à frente
+                [{"file": "rock/track_b.mp3", "id": "1", "pos": "0"}, {"file": "rock/track_c.mp3", "id": "2", "pos": "1"}]  # após adicionar C: 2 à frente
             ]
+            mock_client.addid.side_effect = ["1", "2"]
 
             history = deque(["A"], maxlen=10)
             failed = set()
@@ -243,7 +250,8 @@ class TestRecommendationLogic(unittest.TestCase):
                 play_history=history,
                 failed_tracks=failed,
                 min_queue_ahead=2,
-                max_tries=5
+                max_tries=5,
+                use_feedback=False
             )
 
             self.assertEqual(added, 2)
