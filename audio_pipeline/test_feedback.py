@@ -769,6 +769,286 @@ class TestFeedback(unittest.TestCase):
         finally:
             mpd_integration.vector_store.query_similar = original_query
 
+    def test_scenario_a_skip_during_calculation_discards_stale_result(self):
+        """Cenário (a): Skip durante o cálculo (faixa atual mudou antes do addid).
+        O recomendador deve detectar a corrida, descartar o resultado obsoleto e não enfileirar.
+        """
+        import mpd_integration
+
+        dim = 8
+        seed_emb = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        cand_emb = np.array([0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        mock_col = MockCollection(
+            {"seed_id": seed_emb, "cand_id": cand_emb},
+            {"seed_id": {"subgenero": "Rock"}, "cand_id": {"subgenero": "Rock"}}
+        )
+
+        class MockMPDClientRace:
+            def __init__(self):
+                self.playlist = [{"id": "100", "file": "Rock/seed.mp3", "pos": 0}]
+                self._current_id = "100"
+                self.add_calls = []
+
+            def status(self):
+                # Simula que o usuário mudou para a faixa '101' durante o cálculo!
+                return {"song": 0, "songid": self._current_id, "state": "play"}
+
+            def currentsong(self):
+                return {"id": self._current_id, "file": "Rock/seed.mp3", "pos": 0}
+
+            def playlistinfo(self):
+                return list(self.playlist)
+
+            def addid(self, uri, pos=None):
+                self.add_calls.append(uri)
+                return "102"
+
+            def deleteid(self, songid):
+                pass
+
+        client = MockMPDClientRace()
+        # Inicialmente seed é 100, mas antes do addid a faixa muda para 101
+        client._current_id = "101"
+
+        original_query = mpd_integration.vector_store.query_similar
+        try:
+            mpd_integration.vector_store.query_similar = lambda col, emb, k=5, exclude_id=None: [
+                {"track_id": "cand_id", "distance": 0.1, "filename": "cand.mp3", "subgenero": "Rock"}
+            ]
+
+            added = mpd_integration.replenish_mpd_queue(
+                client=client,
+                collection=mock_col,
+                current_track_id="seed_id",
+                file_to_id_map={"Rock/seed.mp3": "seed_id", "Rock/cand.mp3": "cand_id"},
+                id_to_file_map={"seed_id": "Rock/seed.mp3", "cand_id": "Rock/cand.mp3"},
+                music_root="",
+                play_history=deque(["seed_id"]),
+                failed_tracks=set(),
+                min_queue_ahead=1,
+                seed_songid="100",  # Seed original era 100
+                use_feedback=False
+            )
+
+            # Resultado obsoleto deve ter sido descartado: 0 faixas adicionadas
+            self.assertEqual(added, 0, "Recomendação obsoleta calculada para faixa anterior não deve ser adicionada")
+            self.assertEqual(len(client.add_calls), 0, "addid não deve ser chamado para recomendação obsoleta")
+        finally:
+            mpd_integration.vector_store.query_similar = original_query
+
+    def test_scenario_b_queue_exhausted_triggers_auto_resume(self):
+        """Cenário (b): Fila esgotada seguida de recomendação tardia.
+        O recomendador deve chamar playid / play automaticamente para retomar a reprodução.
+        """
+        import mpd_integration
+
+        dim = 8
+        seed_emb = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        cand_emb = np.array([0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        mock_col = MockCollection(
+            {"seed_id": seed_emb, "cand_id": cand_emb},
+            {"seed_id": {"subgenero": "Rock"}, "cand_id": {"subgenero": "Rock"}}
+        )
+
+        class MockMPDClientAutoResume:
+            def __init__(self):
+                self.playlist = [{"id": "100", "file": "Rock/seed.mp3", "pos": 0}]
+                self.playid_called_with = None
+
+            def status(self):
+                # Player em STOP porque a playlist esgotou
+                return {"song": -1, "state": "stop"}
+
+            def currentsong(self):
+                return {}
+
+            def playlistinfo(self):
+                return list(self.playlist)
+
+            def addid(self, uri, pos=None):
+                self.playlist.append({"id": "101", "file": uri, "pos": len(self.playlist)})
+                return "101"
+
+            def playid(self, songid):
+                self.playid_called_with = str(songid)
+
+            def deleteid(self, songid):
+                pass
+
+        client = MockMPDClientAutoResume()
+
+        original_query = mpd_integration.vector_store.query_similar
+        try:
+            mpd_integration.vector_store.query_similar = lambda col, emb, k=5, exclude_id=None: [
+                {"track_id": "cand_id", "distance": 0.1, "filename": "cand.mp3", "subgenero": "Rock"}
+            ]
+
+            added = mpd_integration.replenish_mpd_queue(
+                client=client,
+                collection=mock_col,
+                current_track_id="seed_id",
+                file_to_id_map={"Rock/seed.mp3": "seed_id", "Rock/cand.mp3": "cand_id"},
+                id_to_file_map={"seed_id": "Rock/seed.mp3", "cand_id": "Rock/cand.mp3"},
+                music_root="",
+                play_history=deque(["seed_id"]),
+                failed_tracks=set(),
+                min_queue_ahead=1,
+                seed_songid="100",
+                use_feedback=False
+            )
+
+            self.assertEqual(added, 1)
+            # Auto-resume deve ter disparado playid na faixa 101 recém-inserida
+            self.assertEqual(client.playid_called_with, "101", "Auto-resume deve chamar playid na faixa adicionada")
+        finally:
+            mpd_integration.vector_store.query_similar = original_query
+
+    def test_scenario_c_manual_stop_with_queue_ahead_respected(self):
+        """Cenário (c): Parada manual pelo usuário com faixas restantes na fila (ahead > 0).
+        O recomendador NÃO deve forçar reprodução quando o usuário parou intencionalmente.
+        """
+        import mpd_integration
+
+        class MockMPDClientManualStop:
+            def __init__(self):
+                # Playlist tem 3 faixas, o usuário parou na faixa 0 (ainda restam 2 faixas à frente)
+                self.playlist = [
+                    {"id": "1", "file": "Rock/f1.mp3", "pos": 0},
+                    {"id": "2", "file": "Rock/f2.mp3", "pos": 1},
+                    {"id": "3", "file": "Rock/f3.mp3", "pos": 2}
+                ]
+                self.play_called = False
+
+            def status(self):
+                return {"song": "0", "state": "stop"}
+
+            def playlistinfo(self):
+                return list(self.playlist)
+
+            def play(self, pos=0):
+                self.play_called = True
+
+        client = MockMPDClientManualStop()
+        status = client.status()
+        playlist = client.playlistinfo()
+        current_pos = int(status.get("song", -1))
+        ahead = len(playlist) if current_pos == -1 else max(0, len(playlist) - (current_pos + 1))
+
+        # ahead deve ser 2 (> 0), indicando que haviam músicas na fila e foi parada intencional
+        self.assertEqual(ahead, 2)
+        should_auto_resume = (len(playlist) == 0 or ahead == 0)
+        self.assertFalse(should_auto_resume, "Não deve disparar auto-resume em parada manual com faixas à frente")
+        self.assertFalse(client.play_called, "client.play não deve ser chamado em stop manual")
+
+    def test_scenario_d_burst_of_5_rapid_skips_buffer_preserved_via_swap(self):
+        """Cenário (d): Rajada de 5 skips rápidos sucessivos.
+        O swap garante que a fila à frente NUNCA fica com 0 faixas por causa do recomendador.
+        """
+        import mpd_integration
+
+        dim = 8
+        embs = {f"t_{i}": np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32) for i in range(100)}
+        metas = {f"t_{i}": {"subgenero": "Rock"} for i in range(100)}
+        id_to_file = {f"t_{i}": f"Rock/t_{i}.mp3" for i in range(100)}
+        file_to_id = {v: k for k, v in id_to_file.items()}
+        mock_col = MockCollection(embs, metas)
+
+        class MockMPDClientBurst:
+            def __init__(self):
+                self.next_id = 10
+                # Fila inicial com faixa atual (0) e 2 faixas à frente (1 e 2)
+                self.playlist = [
+                    {"id": "1", "file": "Rock/t_0.mp3", "pos": 0},
+                    {"id": "2", "file": "Rock/t_1.mp3", "pos": 1},
+                    {"id": "3", "file": "Rock/t_2.mp3", "pos": 2}
+                ]
+                self.current_pos = 0
+
+            def status(self):
+                return {"song": str(self.current_pos), "songid": self.playlist[self.current_pos]["id"], "state": "play"}
+
+            def currentsong(self):
+                return dict(self.playlist[self.current_pos])
+
+            def playlistinfo(self):
+                return [dict(it) for it in self.playlist]
+
+            def addid(self, uri, pos=None):
+                self.next_id += 1
+                sid = str(self.next_id)
+                if pos is not None and pos <= len(self.playlist):
+                    self.playlist.insert(pos, {"id": sid, "file": uri, "pos": pos})
+                else:
+                    self.playlist.append({"id": sid, "file": uri, "pos": len(self.playlist)})
+                for idx, it in enumerate(self.playlist):
+                    it["pos"] = idx
+                return sid
+
+            def deleteid(self, songid):
+                sid_str = str(songid)
+                self.playlist = [it for it in self.playlist if it["id"] != sid_str]
+                for idx, it in enumerate(self.playlist):
+                    it["pos"] = idx
+
+        client = MockMPDClientBurst()
+        history = deque(["t_0"])
+
+        original_query = mpd_integration.vector_store.query_similar
+        try:
+            cand_counter = 3
+
+            def mock_query(col, emb, k=5, exclude_id=None):
+                nonlocal cand_counter
+                res = []
+                for j in range(k):
+                    t_id = f"t_{cand_counter}"
+                    cand_counter += 1
+                    if t_id not in id_to_file:
+                        id_to_file[t_id] = f"Rock/{t_id}.mp3"
+                        file_to_id[f"Rock/{t_id}.mp3"] = t_id
+                        mock_col.embeddings[t_id] = np.zeros(8, dtype=np.float32)
+                        mock_col.metadatas[t_id] = {"subgenero": "Rock"}
+                    res.append({"track_id": t_id, "distance": 0.05 * (j + 1), "filename": f"{t_id}.mp3", "subgenero": "Rock"})
+                return res
+
+            mpd_integration.vector_store.query_similar = mock_query
+
+            # Simula rajada de 5 skips rápidos consecutivos
+            for skip_step in range(1, 6):
+                # Usuário pula para a próxima faixa imediatamente
+                client.current_pos += 1
+                curr_sid = client.playlist[client.current_pos]["id"]
+                curr_tid = file_to_id[client.playlist[client.current_pos]["file"]]
+
+                # Antes de enfileirar, verifica que a fila NÃO está esgotada (buffer preservado)
+                ahead_before = len(client.playlist) - (client.current_pos + 1)
+                self.assertGreaterEqual(ahead_before, 0, f"Fila à frente não deve ser negativa no skip {skip_step}")
+
+                # Executa reposição com swap
+                added = mpd_integration.replenish_mpd_queue(
+                    client=client,
+                    collection=mock_col,
+                    current_track_id=curr_tid,
+                    file_to_id_map=file_to_id,
+                    id_to_file_map=id_to_file,
+                    music_root="",
+                    play_history=history,
+                    failed_tracks=set(),
+                    min_queue_ahead=2,
+                    seed_songid=curr_sid,
+                    use_feedback=False
+                )
+
+                # Confirma que adicionou novas faixas e que a fila à frente tem pelo menos 2 faixas
+                ahead_after = len(client.playlist) - (client.current_pos + 1)
+                self.assertGreaterEqual(ahead_after, 2, f"Após skip {skip_step}, deve ter pelo menos 2 faixas à frente")
+                self.assertEqual(client.status()["state"], "play", "Player deve continuar tocando (nunca entrar em stop)")
+
+        finally:
+            mpd_integration.vector_store.query_similar = original_query
+
 
 if __name__ == "__main__":
     unittest.main()

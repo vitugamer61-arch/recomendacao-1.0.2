@@ -40,7 +40,7 @@ MIN_QUEUE_AHEAD = 2
 CANDIDATES_K = 20
 SELECTION_MODE = "random_top_n"  # "random_top_n", "first", ou "mmr"
 TOP_N_VARIETY = 3
-AUTO_RESUME_PLAY_ON_STOP = False  # Retomar play se o MPD parar com fila esgotada (padrão desligada)
+AUTO_RESUME_PLAY_ON_STOP = True  # Retomar play se o MPD parar com fila esgotada (padrão ativada)
 MAX_REPLENISH_TRIES = 5  # Limite de tentativas no loop de reposição para nunca travar a thread
 SESSION_HISTORY_FILE = "session_history.json"
 RANDOM_SEED = None  # None para aleatório real, ou int fixo para testes determinísticos
@@ -235,11 +235,13 @@ def mpd_purge_pending_recommendations(
     client: MPDClient,
     current_pos: int,
     reason: str = "troca de seed / faixa alterada",
-    feedback_storage: Any = None
+    feedback_storage: Any = None,
+    exclude_songids: set = None
 ) -> int:
     """Remove (via deleteid) todas as faixas ainda não tocadas que o recomendador adicionou.
     
-    NUNCA remove a faixa atual (pos <= current_pos) nem faixas adicionadas manualmente pelo usuário.
+    NUNCA remove a faixa atual (pos <= current_pos), faixas em exclude_songids,
+    nem faixas adicionadas manualmente pelo usuário.
     """
     try:
         playlist = client.playlistinfo()
@@ -266,6 +268,10 @@ def mpd_purge_pending_recommendations(
             continue
 
         song_id_str = str(it.get("id", ""))
+        # Nunca remover faixas recém-inseridas (preservadas pelo swap)
+        if exclude_songids and song_id_str in exclude_songids:
+            continue
+
         ownership = RECOMMENDER_SONGID_MAP.get(song_id_str)
 
         # Se pertencer ao recomendador, deletar
@@ -800,28 +806,24 @@ def replenish_mpd_queue(
 
     status = client.status()
     current_pos = int(status.get("song", -1))
-
-    # Requisito 4: Substituir em vez de acrescentar
-    # Antes de enfileirar uma decisão, remover (deleteid) faixas não tocadas que o recomendador adicionou
-    mpd_purge_pending_recommendations(
-        client=client,
-        current_pos=current_pos,
-        reason=f"Substituição por nova decisão (seed={current_track_id}, songid={seed_songid})",
-        feedback_storage=feedback_storage
-    )
-
     playlist = client.playlistinfo()
-    status = client.status()
-    current_pos = int(status.get("song", -1))
 
-    if current_pos == -1:
-        ahead = len(playlist)
-    else:
-        ahead = len(playlist) - (current_pos + 1)
+    # Identificar faixas pendentes anteriores pertencentes ao recomendador.
+    # Elas NÃO são removidas antes do cálculo para servir de colchão de segurança (a fila nunca fica em 0).
+    # O swap remove essas pendências antigas APÓS enfileirar as novas faixas da decisão atual.
+    old_pending_songids = set()
+    for it in playlist:
+        pos = int(it.get("pos", -1))
+        if current_pos >= 0 and pos <= current_pos:
+            continue
+        sid = str(it.get("id", ""))
+        if sid in RECOMMENDER_SONGID_MAP:
+            old_pending_songids.add(sid)
 
     added_count = 0
     attempts = 0
     current_decision_id = None
+    new_added_ids = set()
 
     # A busca de reposição deve partir da FAIXA EM REPRODUÇÃO (e do q' atualizado), não da última da fila.
     active_seed_id = current_track_id
@@ -837,7 +839,7 @@ def replenish_mpd_queue(
     except Exception as e:
         logging.debug(f"Falha ao checar faixa em reprodução: {e}")
 
-    while ahead < min_queue_ahead and attempts < max_tries:
+    while added_count < min_queue_ahead and attempts < max_tries:
         attempts += 1
 
         # Mapeia todas as músicas atualmente na fila (tanto normalizadas quanto originais)
@@ -891,6 +893,21 @@ def replenish_mpd_queue(
             origem = "exploracao" if candidate_rank > 0 else "recomendada"
 
         try:
+            # Proteção contra corrida: verificar se a faixa tocando mudou durante o cálculo
+            if seed_songid:
+                try:
+                    chk_st = client.status()
+                    chk_song = client.currentsong() if chk_st.get("state") in ("play", "pause") else {}
+                    chk_sid = str(chk_song.get("id", "")) if chk_song else str(chk_st.get("songid", ""))
+                    if chk_sid and chk_sid != seed_songid:
+                        logging.info(
+                            f"[Corrida] Faixa atual mudou durante cálculo (seed={seed_songid} -> atual={chk_sid}). "
+                            f"Descartando recomendação de '{candidate_file}'."
+                        )
+                        break
+                except Exception as e:
+                    logging.debug(f"Erro ao verificar corrida no MPD: {e}")
+
             # Requisito 3: Inserir com addid em posição explícita (logo após a faixa atual)
             # de modo que a selecionada (top-1) seja sempre a próxima, seguida das demais por score.
             insert_pos = (current_pos + 1 + added_count) if current_pos != -1 else None
@@ -903,6 +920,7 @@ def replenish_mpd_queue(
                 origem=origem,
                 feedback_storage=feedback_storage
             )
+            new_added_ids.add(str(song_id))
 
             logging.info(
                 f"Recomendada '{candidate_file}' (posição #{candidate_rank + 1} na lista de candidatas, "
@@ -919,12 +937,20 @@ def replenish_mpd_queue(
             if on_rec_success:
                 on_rec_success()
 
+            # Rede de segurança: auto-resume se o player estiver em stop porque bateu no fim da fila durante o cálculo
+            if AUTO_RESUME_PLAY_ON_STOP:
+                try:
+                    st_now = client.status()
+                    if st_now.get("state") == "stop":
+                        client.playid(str(song_id))
+                        logging.info(f"[Auto-Resume] Retomando reprodução na faixa recém-inserida songid={song_id} (fila esgotada).")
+                except Exception as e:
+                    logging.debug(f"Falha ao acionar auto-resume imediato: {e}")
+
             # Atualiza imediatamente a fila conhecida
             queued_files.add(candidate_file)
             queued_files.add(normalize_mpd_filepath(candidate_file, music_root))
-
             playlist = client.playlistinfo()
-            ahead = len(playlist) - (current_pos + 1) if current_pos != -1 else len(playlist)
 
         except CommandError as e:
             logging.error(f"Candidata '{candidate_file}' rejeitada (motivo: add falhou - {e})")
@@ -934,6 +960,22 @@ def replenish_mpd_queue(
             if msg_queue:
                 msg_queue.put({"type": "recommendation", "text": f"{os.path.basename(candidate_file)} (Falhou)"})
                 msg_queue.put({"type": "log", "text": f"Candidata rejeitada (add falhou): {os.path.basename(candidate_file)}"})
+
+    # SWAP ATÔMICO: purgar pendências antigas agora que as novas faixas já estão inseridas na fila
+    if old_pending_songids and new_added_ids:
+        try:
+            cur_st = client.status()
+            cur_p = int(cur_st.get("song", current_pos))
+            purged = mpd_purge_pending_recommendations(
+                client=client,
+                current_pos=cur_p,
+                reason=f"Swap por nova decisão (seed={current_track_id}, songid={seed_songid})",
+                feedback_storage=feedback_storage,
+                exclude_songids=new_added_ids
+            )
+            logging.info(f"[Swap Concluído] {purged} faixa(s) pendente(s) antiga(s) purgada(s), mantendo novas: {new_added_ids}")
+        except Exception as e:
+            logging.warning(f"Erro ao purgar recomendações antigas no swap: {e}")
 
     if feedback_storage:
         sync_mpd_queue_state(client, file_to_id_map, collection, music_root, feedback_storage)
@@ -1199,9 +1241,11 @@ def monitor_and_recommend(
                             try:
                                 next_pos = max(0, current_pos + 1) if current_pos >= 0 and current_pos + 1 < len(client.playlistinfo()) else 0
                                 client.play(next_pos)
-                                logging.info("Reprodução retomada automaticamente após reposição da fila.")
+                                logging.info(f"[Auto-Resume] Reprodução retomada automaticamente na posição {next_pos} após reposição da fila.")
                             except Exception as e:
                                 logging.error(f"Erro ao retomar reprodução: {e}")
+                else:
+                    logging.info(f"[Stop Manual] MPD parado pelo usuário com {ahead} faixa(s) restante(s) na fila. Respeitando parada manual.")
                         
         except KeyboardInterrupt:
             raise
