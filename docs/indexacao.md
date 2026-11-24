@@ -23,7 +23,7 @@ A tabela abaixo sintetiza as discrepâncias comportamentais confirmadas na anál
 ## 2. Deduplicação por Fingerprint Acústico
 
 ### 2.1. Confirmação sobre `index_library.py`
-A análise completa das 425 linhas de [`audio_pipeline/index_library.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/index_library.py) confirma que o módulo:
+A análise completa das 425 linhas de [`audio_pipeline/index_library.py`](../audio_pipeline/index_library.py) confirma que o módulo:
 1. **Não importa** o módulo `fingerprint.py`.
 2. **Não invoca** `generate_fingerprint`, `run_fpcalc_raw` ou `acoustid`.
 3. A verificação de existência baseia-se unicamente no conjunto retornado por `ids_existentes_no_chroma(collection)`:
@@ -36,7 +36,7 @@ Portanto, se existirem dois arquivos binários exatamente idênticos na pasta (e
 ### 2.2. Implementação em `auto_indexer.py`
 Em contrapartida, a indexação sob demanda implementa deduplicação acústica estrita antes de calcular os embeddings neurais:
 
-- **Arquivo:** [`audio_pipeline/auto_indexer.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/auto_indexer.py)
+- **Arquivo:** [`audio_pipeline/auto_indexer.py`](../audio_pipeline/auto_indexer.py)
 - **Linhas:** 41 a 87
 
 ```python
@@ -82,7 +82,7 @@ Se a similaridade de bits (XOR com deslocamento de janela) entre o fingerprint d
 Como a biblioteca pode estar hospedada em uma unidade virtual montada do Google Drive (`G:\Meu Drive\Musicas`), arquivos em modo "Somente Online" podem ter 0 bytes no momento em que o sistema tenta acessá-los.
 
 O `index_library.py` implementa tratamento específico para esse cenário:
-- **Arquivo:** [`audio_pipeline/index_library.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/index_library.py)
+- **Arquivo:** [`audio_pipeline/index_library.py`](../audio_pipeline/index_library.py)
 - **Linhas:** 230 a 248
 
 ```python

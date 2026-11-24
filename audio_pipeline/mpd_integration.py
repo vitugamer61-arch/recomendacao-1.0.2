@@ -42,6 +42,11 @@ SELECTION_MODE = "random_top_n"  # "random_top_n", "first", ou "mmr"
 TOP_N_VARIETY = 3
 AUTO_RESUME_PLAY_ON_STOP = True  # Retomar play se o MPD parar com fila esgotada (padrão ativada)
 MAX_REPLENISH_TRIES = 5  # Limite de tentativas no loop de reposição para nunca travar a thread
+# Expansão progressiva da busca quando TODAS as candidatas são rejeitadas (cooldown de gênero, skips recentes,
+# histórico). Evita que uma sequência de skips deixe a fila sem recomendação e o MPD pare.
+#   nível 1: busca k x SEARCH_EXPANSION_FACTOR | nível 2: coleção inteira | nível 3 (emergência): sem rejeições do feedback
+SEARCH_EXPANSION_FACTOR = 6
+MAX_EXPANSION_LEVEL = 3
 SESSION_HISTORY_FILE = "session_history.json"
 RANDOM_SEED = None  # None para aleatório real, ou int fixo para testes determinísticos
 
@@ -495,7 +500,8 @@ def select_next_recommendations(
     use_feedback: bool = True,
     seed_songid: str = "",
     gatilho: str = "player",
-    record_audit: bool = True
+    record_audit: bool = True,
+    _expand_level: int = 0
 ) -> tuple[str, dict, int] | None:
     """
     Seleciona a melhor candidata evitando histórico, fila atual e faixas com falha.
@@ -524,6 +530,8 @@ def select_next_recommendations(
     # Aplicação de Rocchio na consulta vetorial se feedback estiver ativo
     search_emb = query_emb
     feedback_engine = None
+    roc_stats: dict = {}
+    emergency = _expand_level >= MAX_EXPANSION_LEVEL
     if use_feedback and HAS_FEEDBACK:
         try:
             feedback_engine = feedback.FeedbackEngine()
@@ -536,6 +544,13 @@ def select_next_recommendations(
 
     similares = []
     search_k = feedback_config.CANDIDATES_N if (use_feedback and HAS_FEEDBACK) else k
+    if _expand_level == 1:
+        search_k = search_k * SEARCH_EXPANSION_FACTOR
+    elif _expand_level >= 2:
+        try:
+            search_k = max(search_k, int(collection.count()))
+        except Exception:
+            search_k = search_k * SEARCH_EXPANSION_FACTOR * 4
 
     # Se modo for cluster e houver cluster válido associado
     # Importante: se o gênero da faixa atual estiver em cooldown ativo, NÃO restringir
@@ -593,7 +608,7 @@ def select_next_recommendations(
         return None
 
     # Re-ranking com penalidades de feedback se ativo
-    if use_feedback and HAS_FEEDBACK and feedback_engine:
+    if use_feedback and HAS_FEEDBACK and feedback_engine and not emergency:
         try:
             reranked = feedback_engine.rerank_candidates(
                 query_emb=query_emb,
@@ -669,6 +684,21 @@ def select_next_recommendations(
             valid_candidates = filter_candidates(set(temp_hist))
 
     if not valid_candidates:
+        if _expand_level < MAX_EXPANSION_LEVEL:
+            logging.warning(
+                f"Nenhuma candidata válida (nível de busca {_expand_level}). "
+                f"Expandindo a busca para o nível {_expand_level + 1}."
+            )
+            if msg_queue:
+                msg_queue.put({"type": "log", "text": f"Sem candidatas: ampliando a busca (nível {_expand_level + 1})"})
+            return select_next_recommendations(
+                collection=collection, current_track_id=current_track_id, id_to_file_map=id_to_file_map,
+                k=k, history=history, queued_files=queued_files, failed_tracks=failed_tracks,
+                selection_mode=selection_mode, top_n=top_n, random_seed=random_seed, msg_queue=msg_queue,
+                recommendation_mode=recommendation_mode, use_feedback=use_feedback,
+                seed_songid=seed_songid, gatilho=gatilho, record_audit=record_audit,
+                _expand_level=_expand_level + 1
+            )
         return None
 
     # Variedade configurável
@@ -1001,6 +1031,12 @@ def monitor_and_recommend(
     last_processed_file = None
     prev_song = None
     prev_status = None
+    # Sessão de recomendação ativa: vira True ao observar o player tocando e só volta a False numa parada MANUAL
+    # (stop com `song` preservado e faixas pendentes). Permite distinguir "a fila acabou durante os skips"
+    # (MPD vai para stop e REMOVE o campo `song` do status) de "MPD parado e ocioso" (ex.: recém-aberto, sem play).
+    # Não depende de o monitor ter visto um `play` entre dois stops: com skips muito rápidos o MPD pode esgotar
+    # a fila de novo antes de o monitor processar o evento da faixa retomada.
+    session_active = False
 
     # Inicializa detector de feedback se ativo
     feedback_detector = None
@@ -1075,6 +1111,7 @@ def monitor_and_recommend(
             state = status.get("state")
             
             if state == "play":
+                session_active = True
                 current_song = client.currentsong()
                 current_song_id = str(current_song.get("id", ""))
                 raw_file = current_song.get("file")
@@ -1205,21 +1242,29 @@ def monitor_and_recommend(
                         sync_mpd_queue_state(client, file_to_id_map, collection, music_root, feedback_detector.storage)
 
             elif state == "stop":
-                # Fila esgotada ou usuário parou a reprodução
+                # Fila esgotada ou usuário parou a reprodução.
+                # Fatos do MPD (verificados): um `stop` manual MANTÉM o campo `song` no status; já ao esgotar a fila
+                # (ex.: skips sequenciais além da última faixa) ou após `clear`, o MPD remove `song`, mas a playlist
+                # continua com todas as faixas já tocadas. Por isso `ahead = len(playlist)` NÃO indica fila pendente.
                 playlist = client.playlistinfo()
+                has_song = "song" in status
                 current_pos = int(status.get("song", -1))
                 ahead = len(playlist) if current_pos == -1 else max(0, len(playlist) - (current_pos + 1))
+                ran_off_end = (not has_song) and session_active and len(playlist) > 0
 
-                # Fila acabou se estiver vazia OU se o MPD atingiu o final da playlist (ahead == 0)
-                if len(playlist) == 0 or ahead == 0:
-                    logging.warning("MPD em estado 'stop' com fila esgotada. Repondo faixas na fila...")
+                # Fila acabou se estiver vazia, se o MPD atingiu o final da playlist (ahead == 0)
+                # ou se o player estava tocando e saiu do fim da fila sem faixa corrente (ran_off_end).
+                if len(playlist) == 0 or ahead == 0 or ran_off_end:
+                    motivo_stop = "fim da fila durante a reprodução" if ran_off_end else "fila esgotada"
+                    logging.warning(f"MPD em estado 'stop' ({motivo_stop}). Repondo faixas na fila...")
                     if msg_queue:
-                        msg_queue.put({"type": "log", "text": "MPD parado (fila esgotada). Repondo fila..."})
+                        msg_queue.put({"type": "log", "text": f"MPD parado ({motivo_stop}). Repondo fila..."})
 
                     # Usa a última faixa do histórico ou alguma faixa conhecida para repor
                     last_id = play_history[-1] if play_history else list(id_to_file_map.keys())[0] if id_to_file_map else None
                     if last_id:
-                        replenish_mpd_queue(
+                        len_before = len(playlist)
+                        added = replenish_mpd_queue(
                             client=client,
                             collection=collection,
                             current_track_id=last_id,
@@ -1236,17 +1281,26 @@ def monitor_and_recommend(
                             recommendation_mode=recommendation_mode,
                             use_feedback=use_feedback
                         )
-                        # Se a constante permitir, retoma a reprodução automaticamente
-                        if AUTO_RESUME_PLAY_ON_STOP:
+                        # Retoma a reprodução na PRIMEIRA faixa recém-inserida (posição len_before, pois sem faixa
+                        # corrente / com a corrente no fim a reposição acrescenta ao final da playlist).
+                        # Nunca usar posição 0: isso reiniciaria uma faixa antiga do histórico.
+                        if AUTO_RESUME_PLAY_ON_STOP and added > 0:
                             try:
-                                next_pos = max(0, current_pos + 1) if current_pos >= 0 and current_pos + 1 < len(client.playlistinfo()) else 0
-                                client.play(next_pos)
-                                logging.info(f"[Auto-Resume] Reprodução retomada automaticamente na posição {next_pos} após reposição da fila.")
+                                if client.status().get("state") == "stop":
+                                    pl_now = client.playlistinfo()
+                                    if len_before < len(pl_now):
+                                        client.play(len_before)
+                                        logging.info(f"[Auto-Resume] Reprodução retomada na posição {len_before} (primeira recomendação nova).")
+                                    else:
+                                        logging.error("[Auto-Resume] Nenhuma faixa nova na fila para retomar a reprodução.")
                             except Exception as e:
                                 logging.error(f"Erro ao retomar reprodução: {e}")
+                        elif added == 0:
+                            logging.error("Reposição não conseguiu adicionar nenhuma faixa mesmo com a busca ampliada.")
                 else:
                     logging.info(f"[Stop Manual] MPD parado pelo usuário com {ahead} faixa(s) restante(s) na fila. Respeitando parada manual.")
-                        
+                    session_active = False
+
         except KeyboardInterrupt:
             raise
         except Exception as e:

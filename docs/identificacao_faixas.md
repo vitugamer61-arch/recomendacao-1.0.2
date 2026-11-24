@@ -13,11 +13,11 @@ Quando o Cantata reproduz faixas através de seu recurso de servidor HTTP embuti
 `http://localhost:port/?file=/caminho/para/arquivo.mp3` ou contendo percent-encoding (`%20` para espaços, `%C3%A1` para acentos, etc.).
 
 A função `normalize_mpd_filepath` trata essas variações:
-- **Arquivo:** [`audio_pipeline/mpd_integration.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/mpd_integration.py)
-- **Linhas:** 121 a 145
+- **Arquivo:** [`audio_pipeline/mpd_integration.py`](../audio_pipeline/mpd_integration.py)
+- **Linhas:** 150 a 174
 
 ```python
-# audio_pipeline/mpd_integration.py:121-145
+# audio_pipeline/mpd_integration.py:150-174
 def normalize_mpd_filepath(raw_path: str, music_root: str = "") -> str:
     """Normaliza caminhos retornados pelo MPD ou URLs do Cantata para o formato relativo padrão."""
     if not raw_path:
@@ -54,7 +54,7 @@ O caminho retornado por `normalize_mpd_filepath` é sempre normalizado com barra
 
 Na inicialização do integrador (`mpd_integration.py:618`), o sistema carrega o arquivo de metadados JSON indicado pelo parâmetro `--metadata` (por padrão `results/metadata.json` no script de inicialização):
 
-- **Arquivo:** [`audio_pipeline/mpd_integration.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/mpd_integration.py)
+- **Arquivo:** [`audio_pipeline/mpd_integration.py`](../audio_pipeline/mpd_integration.py)
 - **Linhas:** 86 a 119
 
 ```python
@@ -130,7 +130,7 @@ No estado atual da base de código, existem **dois padrões mutuamente conflitan
   ```
 
 ### 3.3. Risco Prático e Dados Reais no Repositório
-A inspeção física do arquivo ativo [`audio_pipeline/results/metadata.json`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/results/metadata.json) comprova essa coexistência no mesmo banco:
+A inspeção física do arquivo ativo [`audio_pipeline/results/metadata.json`](../audio_pipeline/results/metadata.json) comprova essa coexistência no mesmo banco:
 - Total de faixas cadastradas: **1.288 faixas**.
 - Registros com ID numérico (`"0000"` a `"0081"`): **67 faixas**.
 - Registros com ID em caminho relativo (`"Eletrônica/..."`, `"Rock/..."`): **1.221 faixas**.

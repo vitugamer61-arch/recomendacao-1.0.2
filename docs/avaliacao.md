@@ -16,11 +16,11 @@ A métrica para a faixa $i$ é a proporção de vizinhos recuperados cujo subgê
 $$P@K(i) = \frac{1}{K} \sum_{j=1}^{K} \mathbb{I}[g(r_j) = g_i]$$
 onde $\mathbb{I}[\cdot]$ é a função indicadora.
 
-- **Arquivo:** [`audio_pipeline/evaluation.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/evaluation.py)
-- **Linhas:** 45 a 63
+- **Arquivo:** [`audio_pipeline/evaluation.py`](../audio_pipeline/evaluation.py)
+- **Linhas:** 200 a 218
 
 ```python
-# audio_pipeline/evaluation.py:45-63
+# audio_pipeline/evaluation.py:200-218
 def precision_at_k_for_track(collection, track_id: str, ground_truth: Dict[str, str], k: int = 5) -> float:
     result = collection.get(ids=[track_id], include=["embeddings"])
     embeddings = result.get('embeddings')
@@ -46,11 +46,11 @@ $$\overline{P@K} = \frac{1}{|\mathcal{T}|} \sum_{i \in \mathcal{T}} P@K(i)$$
 
 ### 1.2. Baseline Aleatória de Monte Carlo
 Para contextualizar se a precisão obtida é superior ao acaso, calcula-se uma baseline de amostragem uniforme:
-- **Arquivo:** [`audio_pipeline/evaluation.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/evaluation.py)
-- **Linhas:** 75 a 95
+- **Arquivo:** [`audio_pipeline/evaluation.py`](../audio_pipeline/evaluation.py)
+- **Linhas:** 230 a 250
 
 ```python
-# audio_pipeline/evaluation.py:75-95
+# audio_pipeline/evaluation.py:230-250
 def random_baseline_precision_at_k(ground_truth: Dict[str, str], k: int = 5, n_trials: int = 100) -> float:
     track_ids = list(ground_truth.keys())
     if len(track_ids) <= k:
@@ -81,11 +81,11 @@ Para cada faixa da coleção, sorteiam-se aleatoriamente $K$ faixas concorrentes
 
 O conjunto de referência (gabarito) é extraído do arquivo `metadata.json` por `load_ground_truth`:
 
-- **Arquivo:** [`audio_pipeline/evaluation.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/evaluation.py)
-- **Linhas:** 12 a 43
+- **Arquivo:** [`audio_pipeline/evaluation.py`](../audio_pipeline/evaluation.py)
+- **Linhas:** 167 a 198
 
 ```python
-# audio_pipeline/evaluation.py:12-43
+# audio_pipeline/evaluation.py:167-198
 def load_ground_truth(metadata_path: str) -> Dict[str, str]:
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Arquivo metadata não encontrado em: {metadata_path}")

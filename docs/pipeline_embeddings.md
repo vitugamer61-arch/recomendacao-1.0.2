@@ -23,7 +23,7 @@ O processamento de cada arquivo de áudio divide-se em 4 etapas lineares:
 
 A leitura física do arquivo é implementada na função `load_audio`:
 
-- **Arquivo:** [`audio_pipeline/ingestion.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/ingestion.py)
+- **Arquivo:** [`audio_pipeline/ingestion.py`](../audio_pipeline/ingestion.py)
 - **Linhas:** 7 a 30
 
 ```python
@@ -55,7 +55,7 @@ def load_audio(filepath: str, sr: int = 48000, offset: float = 0.0, duration: fl
 ```
 
 A chamada concreta em `pipeline.py` define os parâmetros fixos:
-- **Arquivo:** [`audio_pipeline/pipeline.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/pipeline.py)
+- **Arquivo:** [`audio_pipeline/pipeline.py`](../audio_pipeline/pipeline.py)
 - **Linhas:** 23 a 28
 
 ```python
@@ -79,7 +79,7 @@ A chamada concreta em `pipeline.py` define os parâmetros fixos:
 
 A divisão do vetor contínuo em janelas sobrepostas é tratada na função `segment_audio`:
 
-- **Arquivo:** [`audio_pipeline/segmentation.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/segmentation.py)
+- **Arquivo:** [`audio_pipeline/segmentation.py`](../audio_pipeline/segmentation.py)
 - **Linhas:** 3 a 23
 
 ```python
@@ -119,7 +119,7 @@ Em um sinal típico de 45 segundos a 48 kHz:
 
 A transformação espectro-temporal dos segmentos em vetores latentes utiliza a arquitetura HTSAT (*Hierarchical Token-Semantic Audio Transformer*) do projeto LAION-AI implementada na biblioteca `transformers`.
 
-- **Arquivo:** [`audio_pipeline/embedding.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/embedding.py)
+- **Arquivo:** [`audio_pipeline/embedding.py`](../audio_pipeline/embedding.py)
 - **Linhas:** 8 a 21 (Carregamento Singleton do Modelo)
 
 ```python
@@ -139,7 +139,7 @@ def _load_model():
         _MODEL.eval()
 ```
 
-- **Arquivo:** [`audio_pipeline/embedding.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/embedding.py)
+- **Arquivo:** [`audio_pipeline/embedding.py`](../audio_pipeline/embedding.py)
 - **Linhas:** 44 a 63 (Extração em Lote)
 
 ```python
@@ -177,7 +177,7 @@ def generate_embeddings_batch(audio_segments: list[np.ndarray], sr: int) -> list
 
 A redução da matriz temporal de segmentos para um vetor global fixo é executada por `aggregate_embeddings`:
 
-- **Arquivo:** [`audio_pipeline/pooling.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/pooling.py)
+- **Arquivo:** [`audio_pipeline/pooling.py`](../audio_pipeline/pooling.py)
 - **Linhas:** 3 a 17
 
 ```python
@@ -210,7 +210,7 @@ O método `"transformer"` está explicitamente sinalizado com `NotImplementedErr
 ### 2.5. Integração em `pipeline.process_track`
 
 A unificação dos passos em uma estrutura de dados de retorno ocorre em:
-- **Arquivo:** [`audio_pipeline/pipeline.py`](file:///c:/Codigos/Recomendacao_musicas_c.1.01/audio_pipeline/pipeline.py)
+- **Arquivo:** [`audio_pipeline/pipeline.py`](../audio_pipeline/pipeline.py)
 - **Linhas:** 18 a 58
 
 ```python

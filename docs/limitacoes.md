@@ -11,13 +11,16 @@ Este documento registra de forma técnica e objetiva as inconsistências, fragil
 | **1** | Duplicidade e Conflito de Arquivos de Metadados | `pipeline.py:60`, `vector_store.py:103`, `index_library.py:41`, `iniciar_sistema.bat:57` | **Recomendação Audível e Avaliação** |
 | **2** | Mistura de Padrões de Identificador (`track_id`) | `auto_indexer.py:108` vs. `index_library.py:53` | **Recomendação Audível e Indexação** |
 | **3** | Deduplicação Acústica Inexistente na Indexação em Lote | `index_library.py:186` | **Recomendação Audível** (desperdício de espaço/cálculo) |
-| **4** | Desacoplamento entre Base de Ground Truth e Base do ChromaDB | `evaluation.py:12` e `evaluation.py:53` | **Avaliação (Métricas P@K)** |
-| **5** | Exceção `AssertionError` Não Capturada na Avaliação | `evaluation.py:41` | **Avaliação (Métricas P@K)** |
+| **4** | Desacoplamento entre Base de Ground Truth e Base do ChromaDB | `load_ground_truth` e `precision_at_k_for_track` (`evaluation.py`) | **Avaliação (Métricas P@K)** |
+| **5** | Exceção `AssertionError` Não Capturada na Avaliação | `load_ground_truth` (`evaluation.py:196`) | **Avaliação (Métricas P@K)** |
 | **6** | Dependência Crítica de Ponto de Montagem do Google Drive | `iniciar_sistema.bat:26`, `clean_orphans2.py:6` | **Recomendação Audível** (bloqueio de inicialização) |
 | **7** | Caminhos Absolutos Fixos no Código (*Hardcoded Paths*) | `iniciar_sistema.bat:34`, `clean_orphans2.py:6` | **Portabilidade e Execução** |
-| **8** | Ausência de Tratamento de Erro na Conexão Inicial do MPD | `mpd_integration.py:652`, `mpd_integration.py:71` | **Recomendação Audível** (falha fatal na inicialização) |
+| **8** | Ausência de Tratamento de Erro na Conexão Inicial do MPD | `connect_mpd` (`mpd_integration.py:78`) e `run_recommender` (`mpd_integration.py:1361`) | **Recomendação Audível** (falha fatal na inicialização) |
 | **9** | Custo Computacional do Modelo CLAP em CPU | `embedding.py:11`, `pipeline.py:23-45` | **Recomendação Audível e Indexação** (latência elevada) |
-| **10** | Detecção de Mudança de Faixa sem Uso de `songid` | `mpd_integration.py:469` | **Recomendação Audível** (falha em faixas repetidas) |
+| **10** | ~~Detecção de Mudança de Faixa sem Uso de `songid`~~ **(resolvida)** | `monitor_and_recommend` (`mpd_integration.py`) | Resolvida: a troca de faixa é identificada por `songid` (seção 2.10) |
+| **11** | Histórico de sessão inclui faixas enfileiradas e ainda não tocadas | `replenish_mpd_queue` (`mpd_integration.py`) | **Recomendação Audível** (skips em sequência reduzem o conjunto de candidatas) |
+| **12** | Nível de emergência da busca ignora o cooldown de gênero | `select_next_recommendations` (`mpd_integration.py`) | **Recomendação Audível** (só quando nenhuma faixa elegível sobra) |
+| **13** | Correção dos skips validada apenas em Linux, com áudio sintético | `test_skip_sequencial.py` e ensaio descrito em `recomendacao_e_fila.md` | **Validação** (não confirmada no MPD do Windows nem com o CLAP) |
 
 ---
 
@@ -69,12 +72,12 @@ Este documento registra de forma técnica e objetiva as inconsistências, fragil
 
 ### 2.5. Exceção `AssertionError` Não Capturada na Avaliação
 - **O que o código faz:**
-  Em `evaluation.py:40-41`:
+  Em `load_ground_truth` (`evaluation.py:196`):
   ```python
   if missing_subgenre:
       raise AssertionError(f"Erro de sanidade: {len(missing_subgenre)} faixas estão sem subgenero preenchido...")
   ```
-  No bloco principal `__main__` (`evaluation.py:136-139`), o código captura unicamente `except ValueError as e:`.
+  No bloco principal `__main__` (`evaluation.py:292`), o código captura unicamente `except ValueError as e:`.
 - **O que deveria fazer:**
   Capturar explicitamente `AssertionError` ou tratar entradas sem subgênero descartando-as com aviso no log em vez de abortar com traceback não tratado.
 - **Impacto:** **Afeta exclusivamente a avaliação**. Se uma única faixa for salva na raiz da biblioteca (sem pasta mãe de subgênero), o script de avaliação é abortado com erro fatal antes de calcular qualquer métrica.
@@ -113,12 +116,12 @@ Este documento registra de forma técnica e objetiva as inconsistências, fragil
 
 ### 2.8. Ausência de Tratamento de Erro Fatal na Conexão Inicial do MPD
 - **O que o código faz:**
-  - Na função `connect_mpd` (`mpd_integration.py:60-71`), há um laço de 3 tentativas com backoff exponencial.
-  - Ao final das 3 tentativas, a função executa `raise e`.
-  - No bloco `__main__` de `mpd_integration.py:652`, a chamada `connect_mpd` está dentro de um bloco `try` que trata apenas `KeyboardInterrupt` e `except:` genérico, mas que em seguida tenta manipular o processo e desconectar.
+  - `connect_mpd` (`mpd_integration.py:78`) faz 3 tentativas com espera exponencial (1 s e 2 s entre elas) e, ao final, executa `raise e`.
+  - Em `run_recommender` (`mpd_integration.py:1361`), a chamada a `connect_mpd` não tem tratamento específico no ponto da chamada: a exceção sobe ao chamador.
+  - Atenuante: a etapa 1 do `iniciar.py` verifica e inicia o MPD na porta 6600 antes de iniciar o recomendador.
 - **O que deveria fazer:**
   Validar explicitamente a disponibilidade da porta 6600 antes de iniciar as threads de monitoramento e a interface gráfica `StatusWindow`, emitindo diagnóstico claro ao usuário caso o daemon do MPD tenha caído na inicialização por erro de saída de áudio.
-- **Impacto:** **Afeta a recomendação audível**. O integrador encerra o processo sem notificar de forma legível o usuário na interface gráfica caso o serviço de áudio do MPD não tenha subido a tempo.
+- **Impacto:** **Afeta a recomendação audível**. Fora do `iniciar.py` (execução direta do módulo), o processo termina com traceback se o MPD não estiver disponível.
 
 ---
 
@@ -136,14 +139,25 @@ Este documento registra de forma técnica e objetiva as inconsistências, fragil
 
 ---
 
-### 2.10. Detecção de Mudança de Faixa sem Uso de `songid`
-- **O que o código faz:**
-  O integrador baseia-se unicamente em:
-  ```python
-  # mpd_integration.py:469
-  if current_file == last_processed_file:
-      continue
-  ```
-- **O que deveria fazer:**
-  Comparar a tupla `(status.get("songid"), current_file)` para diferenciar instâncias temporais de reprodução.
-- **Impacto:** **Afeta a recomendação audível**. Se o usuário repetir a mesma música em loop (*single track repeat*) ou tiver a mesma música duas vezes consecutivas na playlist, a transição é ignorada pelo integrador e novas recomendações deixam de ser adicionadas à fila.
+### 2.10. Detecção de Mudança de Faixa por `songid` (resolvida)
+- **Situação anterior:** o integrador comparava apenas o caminho do arquivo (`current_file == last_processed_file`), então a mesma música duas vezes seguidas na playlist não disparava nova recomendação.
+- **Situação atual:** a faixa em reprodução é identificada pelo `songid`, e cada ocorrência na fila tem um `songid` próprio (ver [recomendacao_e_fila.md](recomendacao_e_fila.md), seção 1.1).
+- **Limitação remanescente (intencional):** com *repeat single* o `songid` não muda, então a repetição da faixa atual não gera nova recomendação.
+
+---
+
+### 2.11. Histórico de Sessão Inclui Faixas Enfileiradas e Ainda Não Tocadas
+- **O que o código faz:** `replenish_mpd_queue` registra cada recomendação enfileirada no histórico (`play_history.append`), mesmo que o usuário a pule antes de ouvir.
+- **Impacto:** uma sequência de skips preenche o histórico (até 30 entradas, no máximo 50% do acervo) com faixas não ouvidas, reduzindo as candidatas. O relaxamento do histórico e a expansão da busca (ver [recomendacao_e_fila.md](recomendacao_e_fila.md), seções 3.3 e 3.4) evitam que isso pare a reprodução, mas a escolha pode se afastar da faixa atual.
+
+---
+
+### 2.12. Nível de Emergência da Busca Ignora o Cooldown de Gênero
+- **O que o código faz:** se nenhuma faixa elegível sobra nos níveis 0 a 2 da busca, o nível 3 desconsidera as rejeições do feedback (cooldown e skips recentes) para que a música não pare.
+- **Impacto:** nessa situação, o sistema pode recomendar um gênero que o usuário acabou de pular. É um compromisso deliberado entre respeitar o feedback e manter a reprodução contínua. Os níveis anteriores tendem a resolver antes, escolhendo outros gêneros.
+
+---
+
+### 2.13. Validação da Correção de Skips Restrita ao Ambiente de Ensaio
+- **O que foi feito:** ensaio em Linux (MPD 0.23.14), com o código real, o módulo de feedback real e uma cópia do ChromaDB real, mas com áudio sintético e sem executar o CLAP.
+- **O que não foi confirmado:** o comportamento no MPD do Windows (o MPD remove o campo `song` do status ao esgotar a fila; verificado no MPD 0.23.14) e o desempenho com o tempo real de inferência do CLAP.

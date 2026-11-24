@@ -85,18 +85,20 @@ O ciclo operacional completo é orientado a eventos e polling de bloqueio longo 
 A divisão funcional do sistema é organizada nos seguintes arquivos dentro de `audio_pipeline/`:
 
 ### 2.1. `mpd_integration.py`
-Módulo orquestrador em tempo real. Não existe um arquivo isolado denominado `mpd_recommender.py` na base; toda a lógica algorítmica de recomendação e reposição de fila reside diretamente em `mpd_integration.py`.
+Módulo orquestrador em tempo real. Não existe um arquivo isolado denominado `mpd_recommender.py` na base; toda a lógica de recomendação e reposição de fila reside em `mpd_integration.py`. As referências abaixo são por função, pois os números de linha mudam.
 
-- **`connect_mpd(host, port)`** (`mpd_integration.py:54`): Estabelece conexão com o socket TCP do MPD aplicando retentativas automáticas (`max_retries = 3`) com recuo exponencial.
-- **`reconnect_if_needed(client)`** (`mpd_integration.py:73`): Executa `client.ping()`. Caso a conexão tenha caído (`ConnectionError`, `BrokenPipeError`, etc.), fecha o descritor e reconecta.
-- **`build_file_to_id_map(metadata_path, music_library_root)`** (`mpd_integration.py:86`): Lê o arquivo de metadados JSON e compila dicionários em memória para tradução bidirecional (`file_to_id` e `id_to_file`).
-- **`normalize_mpd_filepath(raw_path, music_root)`** (`mpd_integration.py:121`): Trata URLs geradas pelo servidor HTTP interno do Cantata (`?file=...`), aplica `urllib.parse.unquote()` e converte caminhos absolutos em caminhos relativos ao `music_root`.
-- **`load_session_history(filepath, max_len)`** (`mpd_integration.py:147`): Lê o histórico de faixas persistido no disco estruturado como `collections.deque(maxlen=max_len)`.
-- **`save_session_history(history, filepath)`** (`mpd_integration.py:160`): Grava o histórico de reprodução em um arquivo temporário (`.tmp`) e realiza substituição atômica via `os.replace()` para evitar corrupção.
-- **`compute_mmr_selection(candidates, collection, play_history, lambda_param)`** (`mpd_integration.py:170`): Calcula o score MMR ponderando similaridade de cosseno com a faixa semente versus redundância em relação aos últimos 5 itens tocados.
-- **`select_next_recommendations(...)`** (`mpd_integration.py:227`): Consulta vizinhos no ChromaDB para o `current_track_id`, elimina faixas que constam no histórico recente, na fila ou em falhas de reprodução, relaxa restrições caso o histórico esteja esgotado e escolhe a faixa de acordo com a estratégia configurada (`random_top_n`, `first` ou `mmr`).
-- **`replenish_mpd_queue(...)`** (`mpd_integration.py:316`): Obtém `client.playlistinfo()`, calcula a quantidade de itens à frente da posição corrente (`ahead`) e injeta novas faixas via `client.add()` até que a fila atinja `min_queue_ahead` (limitado a `max_tries`).
-- **`monitor_and_recommend(...)`** (`mpd_integration.py:414`): Executa em thread secundária. Entra em laço contínuo com `client.idle("player")`, captura transições de estado (`play`, `stop`), aciona a indexação sob demanda quando a faixa não possui mapeamento e despacha mensagens para a interface de monitoramento.
+- **`connect_mpd(host, port)`**: Estabelece conexão com o socket TCP do MPD aplicando retentativas automáticas (`max_retries = 3`) com recuo exponencial.
+- **`reconnect_if_needed(client)`**: Executa `client.ping()`. Caso a conexão tenha caído (`ConnectionError`, `BrokenPipeError`, etc.), fecha o descritor e reconecta.
+- **`build_file_to_id_map(metadata_path, music_library_root)`**: Lê o arquivo de metadados JSON e compila dicionários em memória para tradução bidirecional (`file_to_id` e `id_to_file`).
+- **`normalize_mpd_filepath(raw_path, music_root)`**: Trata URLs geradas pelo servidor HTTP interno do Cantata (`?file=...`), aplica `urllib.parse.unquote()` e converte caminhos absolutos em caminhos relativos ao `music_root`.
+- **`load_session_history` / `save_session_history`**: Histórico de faixas como `collections.deque(maxlen=...)`, persistido em `session_history.json` com gravação atômica (`.tmp` + `os.replace()`).
+- **`compute_mmr_selection(...)`**: Score MMR ponderando similaridade com a faixa semente versus redundância em relação aos últimos 5 itens tocados.
+- **`select_next_recommendations(...)`**: Escolhe a próxima faixa: vetor de consulta (com Rocchio se o feedback estiver ligado), busca de vizinhas no ChromaDB, re-ranking e rejeição por feedback, filtros (histórico, fila, falhas), relaxamento do histórico, **expansão progressiva da busca** quando todas são rejeitadas, e estratégia de escolha (`random_top_n`, `first` ou `mmr`). Detalhes em [recomendacao_e_fila.md](recomendacao_e_fila.md).
+- **`replenish_mpd_queue(...)`**: Insere até `MIN_QUEUE_AHEAD` recomendações novas logo após a faixa atual (`addid` em posição explícita) e depois remove as pendências antigas do recomendador (swap), com descarte por corrida e limite `max_tries`.
+- **`mpd_add_recommendation_unified(...)` / `mpd_purge_pending_recommendations(...)`**: Inserção e remoção de faixas do recomendador, com controle de propriedade por `songid` (a faixa atual e as anteriores nunca são removidas).
+- **`sync_mpd_queue_state(...)`**: Espelha a fila do MPD no SQLite (`mpd_queue_state`) para o monitor.
+- **`monitor_and_recommend(...)`**: Executa em thread secundária. Laço contínuo com `client.idle("player")`; no estado `play` identifica a faixa por `songid` e dispara o ciclo de recomendação; no estado `stop` distingue fim da fila de parada manual e retoma a reprodução quando cabe; aciona a indexação sob demanda quando a faixa não possui mapeamento e despacha mensagens para a interface de monitoramento.
+- **`run_recommender(...)`**: Ponto de entrada que conecta ao MPD, monta os mapas e inicia o monitor.
 
 ### 2.2. `auto_indexer.py`
 Módulo de contingência para catalogação imediata (*on-the-fly* / *lazy indexing*).
@@ -131,11 +133,23 @@ Módulo de identificação acústica para evitar duplicatas de áudio idêntico 
 ### 2.6. `evaluation.py` e `results/generate_precision_k.py`
 Módulos de avaliação offline e acompanhamento estatístico da qualidade da representação vetorial.
 
-- **`load_ground_truth(metadata_path)`** (`evaluation.py:12`): Mapeia `{track_id: subgenero}` para calcular correspondência temática.
-- **`precision_at_k_for_track(collection, track_id, ground_truth, k)`** (`evaluation.py:45`): Calcula a métrica Precision@K para uma faixa individual inspecionando se os K vizinhos recuperados no ChromaDB pertencem ao mesmo subgênero do semente.
-- **`random_baseline_precision_at_k(ground_truth, k, n_trials)`** (`evaluation.py:75`): Estima a precisão esperada por sorteio puramente aleatório uniforme através de simulações de Monte Carlo.
-- **`run_full_evaluation(collection, ground_truth, k_values)`** (`evaluation.py:97`): Executa o benchmark para múltiplos valores de K (`[1, 3, 5, 10]`) e computa o ganho relativo em relação à baseline.
+- **`load_ground_truth(metadata_path)`** (`evaluation.py:167`): Mapeia `{track_id: subgenero}` para calcular correspondência temática.
+- **`precision_at_k_for_track(collection, track_id, ground_truth, k)`** (`evaluation.py:200`): Calcula a métrica Precision@K para uma faixa individual inspecionando se os K vizinhos recuperados no ChromaDB pertencem ao mesmo subgênero do semente.
+- **`random_baseline_precision_at_k(ground_truth, k, n_trials)`** (`evaluation.py:230`): Estima a precisão esperada por sorteio puramente aleatório uniforme através de simulações de Monte Carlo.
+- **`run_full_evaluation(collection, ground_truth, k_values)`** (`evaluation.py:252`): Executa o benchmark para múltiplos valores de K (`[1, 3, 5, 10]`) e computa o ganho relativo em relação à baseline.
 
 ### 2.7. `status_window.py`
 Interface gráfica em `tkinter` desacoplada via `queue.Queue`.
 - **`StatusWindow`** (`status_window.py:49`): Renderiza janela flutuante com mostradores de estado operacional (Monitorando, Indexando, Erro), contadores de recomendações geradas, indexações sob demanda e log recente de eventos.
+
+### 2.8. `feedback.py` e `feedback_config.py`
+Feedback implícito por skip/reprodução parcial/completa, adaptação Rocchio do vetor de consulta, re-ranking com penalidade de faixa e de gênero, e cooldown de gênero. Persistência em SQLite (`results/feedback.db`). Ver [feedback_implicito.md](feedback_implicito.md).
+
+### 2.9. `clustering.py`
+Agrupamento das faixas por similaridade sonora (K-Means com refinamento por pureza, HDBSCAN opcional), nomeação por gênero predominante, atribuição incremental de faixas novas e exportação de playlists. Ver [clusterizacao.md](clusterizacao.md).
+
+### 2.10. `iniciar.py`
+Ponto de entrada único em 6 etapas: MPD, indexação, clusterização, sincronização de playlists por cluster, Monitor de Precisão (Streamlit) e recomendador. Opções: `--pasta`, `--recalcular`, `--modo`, `--sem-feedback`, `--zerar-feedback`, `--sem-cluster`, `--no-gui`, `--sem-monitor`, `--seed`.
+
+### 2.11. `testes_disponibilidade/`
+Suíte externa de disponibilidade do serviço de consulta ao ChromaDB (watchdog, injeção de falhas, carga e restauração). Ver [disponibilidade.md](disponibilidade.md).
