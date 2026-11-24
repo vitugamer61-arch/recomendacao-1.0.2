@@ -1,0 +1,10 @@
+metrica,slo,linha_de_base,estresse,status_estresse
+Disponibilidade ponderada pelo tempo,≥ 99.9%,100.00%,90.61%,❌ REPROVADO
+Disponibilidade analítica (MTBF/(MTBF+MTTR)),≥ 99.9%,100.00%,84.67%,❌ REPROVADO
+Disponibilidade por consultas (amostragem simples),≥ 99.9%,100.00%,90.61%,❌ REPROVADO
+MTTR médio (falhas.csv — confirmação de morte),≤ 10.0 s,N/A (0 falhas),9.197 s,✅ APROVADO
+MTTR médio (verificação cruzada monitor.csv),≤ 10.0 s,N/A (0 falhas),14.333 s,❌ REPROVADO
+MTTR mín / máx / desvio padrão (primário),—,—,0.248 s / 17.819 s / ±8.790 s,—
+Taxa de sucesso — monitoramento,≥ 99.9%,100.00%,90.61%,❌ REPROVADO
+Taxa de sucesso — teste de carga,≥ 99.9%,—,100.00%,✅ APROVADO
+Tempo de restauração do índice,≤ 60.0 s,—,7.526 s,✅ APROVADO

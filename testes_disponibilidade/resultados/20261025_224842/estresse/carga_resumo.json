@@ -1,0 +1,15 @@
+{
+  "threads": 4,
+  "total_consultas": 100,
+  "sucessos": 100,
+  "falhas": 0,
+  "taxa_sucesso_pct": 100.0,
+  "duracao_total_s": 0.58,
+  "throughput_qps": 172.49,
+  "latencia_media_ms": 22.671,
+  "latencia_p50_ms": 22.673,
+  "latencia_p95_ms": 32.115,
+  "latencia_p99_ms": 37.025,
+  "latencia_max_ms": 40.089,
+  "latencia_std_ms": 5.965
+}

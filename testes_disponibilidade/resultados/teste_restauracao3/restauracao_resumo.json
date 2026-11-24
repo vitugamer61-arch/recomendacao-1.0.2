@@ -1,0 +1,26 @@
+{
+  "track_referencia": "0015",
+  "top_k_antes": [
+    "Eletrônica/Alok & Bhaskar - FUEGO (Original Mix).mp3",
+    "teste/8mgoh0h671.mp3",
+    "Eletrônica/Nirvana - Come As You Are (Evokings Remix).mp3",
+    "Eletrônica/Numb (Slowed).mp3",
+    "Eletrônica/Raum und Zeit.mp3"
+  ],
+  "top_k_depois": [
+    "Eletrônica/Alok & Bhaskar - FUEGO (Original Mix).mp3",
+    "teste/8mgoh0h671.mp3",
+    "Eletrônica/Nirvana - Come As You Are (Evokings Remix).mp3",
+    "Eletrônica/Numb (Slowed).mp3",
+    "Eletrônica/Raum und Zeit.mp3"
+  ],
+  "comparacao": {
+    "identico": true,
+    "sobreposicao": 5,
+    "total_k": 5,
+    "precisao_set": 1.0
+  },
+  "duracao_reconstrucao_s": 3.7871,
+  "duracao_primeira_consulta_s": 3.5556,
+  "tempo_total_restauracao_s": 7.3427
+}

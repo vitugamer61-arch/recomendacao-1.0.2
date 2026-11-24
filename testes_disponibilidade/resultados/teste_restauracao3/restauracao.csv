@@ -1,0 +1,8 @@
+timestamp,etapa,duracao_s,detalhe
+2026-10-26T00:55:32.415527+00:00,copia_chroma,0.0247,
+2026-10-26T00:55:36.417665+00:00,top_k_antes,4.002,"track_ref=0015 top_k=['Eletrônica/Alok & Bhaskar - FUEGO (Original Mix).mp3', 'teste/8mgoh0h671.mp3', 'Eletrônica/Nirvana - Come As You Are (Evokings Remix).mp3', 'Eletrônica/Numb (Slowed).mp3', 'Eletrônica/Raum und Zeit.mp3']"
+2026-10-26T00:55:36.423709+00:00,destruicao_indice,0.0058,
+2026-10-26T00:55:40.210865+00:00,reconstrucao_indice,3.7871,
+2026-10-26T00:55:43.766527+00:00,primeira_consulta_pos_restauracao,3.5556,
+2026-10-26T00:55:43.766797+00:00,tempo_total_restauracao,7.3427,
+2026-10-26T00:55:43.766983+00:00,comparacao_top_k,0.0,"{""identico"": true, ""sobreposicao"": 5, ""total_k"": 5, ""precisao_set"": 1.0}"

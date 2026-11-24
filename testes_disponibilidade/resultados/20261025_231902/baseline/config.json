@@ -1,0 +1,13 @@
+{
+  "modo": "baseline",
+  "intervalo": 1.0,
+  "falhas": 0,
+  "consultas": 0,
+  "duracao_min": 60.0,
+  "threads": 1,
+  "porta": 7700,
+  "intervalo_watchdog": 1.0,
+  "semente": 42,
+  "incluir_mpd": false,
+  "sem_falhas": true
+}

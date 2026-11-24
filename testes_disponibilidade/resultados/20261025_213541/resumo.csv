@@ -1,0 +1,8 @@
+metrica,slo,resultado,status
+Disponibilidade no período (consultas),≥ 99.9%,0.0%,❌ REPROVADO
+Disponibilidade (fórmula MTBF/MTTR),≥ 99.9%,N/A,N/A
+MTTR médio (módulo Python + ChromaDB),≤ 10.0 s,N/A,N/A
+MTTR mín / máx / desvio,—,N/A / N/A / ±N/A,—
+Taxa de sucesso — monitoramento,≥ 99.9%,0.0%,❌ REPROVADO
+Taxa de sucesso — teste de carga,≥ 99.9%,0.0%,❌ REPROVADO
+Tempo de restauração do índice,≤ 60.0 s,N/A,N/A

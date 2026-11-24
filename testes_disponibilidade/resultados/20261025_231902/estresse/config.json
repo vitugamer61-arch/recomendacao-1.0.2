@@ -1,0 +1,13 @@
+{
+  "modo": "estresse",
+  "intervalo": 1.0,
+  "falhas": 10,
+  "consultas": 1000,
+  "duracao_min": 30.0,
+  "threads": 4,
+  "porta": 7700,
+  "intervalo_watchdog": 1.0,
+  "semente": 42,
+  "incluir_mpd": false,
+  "sem_falhas": false
+}
