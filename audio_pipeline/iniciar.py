@@ -26,16 +26,48 @@ _SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 import config
-import vector_store
-import index_library
-import clustering
-import mpd_integration
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("iniciar")
+
+# Módulos pesados (chromadb, scikit-learn, pandas, matplotlib...) são carregados por _carregar_modulos(),
+# DEPOIS de o banner aparecer. Importá-los no topo deixava o console mudo por vários segundos na partida,
+# dando a impressão de que o sistema não estava funcionando.
+vector_store = None
+index_library = None
+clustering = None
+mpd_integration = None
+
+
+def _carregar_modulos() -> None:
+    """Importa os módulos pesados e informa o tempo gasto."""
+    global vector_store, index_library, clustering, mpd_integration
+    t0 = time.time()
+    logger.info("Carregando módulos (ChromaDB, scikit-learn, pandas...). Pode levar alguns segundos...")
+    import vector_store as _vector_store
+    import index_library as _index_library
+    import clustering as _clustering
+    import mpd_integration as _mpd_integration
+    vector_store, index_library, clustering, mpd_integration = _vector_store, _index_library, _clustering, _mpd_integration
+    logger.info(f"Módulos carregados em {time.time() - t0:.1f} s.")
+
+
+class _etapa:
+    """Mede e registra a duração de cada etapa da inicialização."""
+
+    def __init__(self, rotulo: str):
+        self.rotulo = rotulo
+
+    def __enter__(self):
+        self.t0 = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        logger.info(f"{self.rotulo} concluída em {time.time() - self.t0:.1f} s.")
+        return False
 
 
 def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -313,38 +345,46 @@ def main():
     logger.info(f" Monitor Precisão : {'desativado (--sem-monitor)' if args.sem_monitor else f'Streamlit na porta {config.STREAMLIT_PORT}'}")
     logger.info("============================================================\n")
 
+    t_inicio_total = time.time()
     monitor_proc = None
 
     try:
+        _carregar_modulos()
+
         # Etapa 1: MPD
-        etapa_1_mpd(
-            host=config.MPD_HOST,
-            port=config.MPD_PORT,
-            exe_path=config.MPD_EXE_PATH,
-            conf_path=config.MPD_CONF_PATH
-        )
+        with _etapa("[1/6] MPD"):
+            etapa_1_mpd(
+                host=config.MPD_HOST,
+                port=config.MPD_PORT,
+                exe_path=config.MPD_EXE_PATH,
+                conf_path=config.MPD_CONF_PATH
+            )
 
         # Conectar ChromaDB
-        chroma_client = vector_store.get_client(config.CHROMA_PERSIST_DIR)
-        collection = vector_store.get_or_create_collection(chroma_client, config.COLLECTION_NAME)
+        with _etapa("Conexão com o ChromaDB"):
+            chroma_client = vector_store.get_client(config.CHROMA_PERSIST_DIR)
+            collection = vector_store.get_or_create_collection(chroma_client, config.COLLECTION_NAME)
 
         # Etapa 2: Indexação automática
-        novas_faixas = etapa_2_indexacao(music_root, collection)
+        with _etapa("[2/6] Verificação da biblioteca"):
+            novas_faixas = etapa_2_indexacao(music_root, collection)
 
         # Etapa 3: Clusterização (completa se --recalcular ou ausente, incremental se novas faixas)
-        etapa_3_clusterizacao(
-            novas_faixas=novas_faixas,
-            recalcular=args.recalcular,
-            modo=args.modo,
-            pureza_minima=args.pureza_minima,
-            tamanho_minimo=args.tamanho_minimo,
-            profundidade_maxima=args.profundidade_maxima,
-            seed=args.seed
-        )
+        with _etapa("[3/6] Clusterização"):
+            etapa_3_clusterizacao(
+                novas_faixas=novas_faixas,
+                recalcular=args.recalcular,
+                modo=args.modo,
+                pureza_minima=args.pureza_minima,
+                tamanho_minimo=args.tamanho_minimo,
+                profundidade_maxima=args.profundidade_maxima,
+                seed=args.seed
+            )
 
         # Etapa 4: Atualização de playlists no MPD (a menos que explicitamente sem cluster)
         if not args.sem_cluster:
-            etapa_4_playlists(music_root)
+            with _etapa("[4/6] Playlists por cluster"):
+                etapa_4_playlists(music_root)
 
         # Etapa 5: Iniciar Monitor de Precisão (Dashboard Streamlit) em paralelo
         monitor_log_file = None
@@ -416,6 +456,8 @@ def main():
                 )
         else:
             logger.info("[5/6] Monitor de Precisão desativado (--sem-monitor).")
+
+        logger.info(f"Preparação concluída em {time.time() - t_inicio_total:.1f} s. Iniciando o recomendador...")
 
         # Etapa 6: Iniciar recomendador em primeiro plano
         rec_mode = "similarity" if args.sem_cluster else "cluster"

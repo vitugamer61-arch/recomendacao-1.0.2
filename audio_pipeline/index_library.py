@@ -31,7 +31,17 @@ sys.path.insert(0, str(_SCRIPT_DIR))
 
 import config
 import vector_store
-from pipeline import process_track
+
+
+def process_track(*args, **kwargs):
+    """Importação tardia de pipeline.process_track.
+
+    O módulo `pipeline` importa torch e transformers (CLAP), o que leva vários segundos. Só é necessário
+    quando uma faixa realmente precisa ser indexada; no uso normal (biblioteca já indexada) não é carregado.
+    """
+    from pipeline import process_track as _process_track
+    return _process_track(*args, **kwargs)
+
 
 # ── constantes ────────────────────────────────────────────────────────────────
 EXTENSOES_SUPORTADAS = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".WAV", ".MP3", ".FLAC"}

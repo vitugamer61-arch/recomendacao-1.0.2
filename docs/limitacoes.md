@@ -21,6 +21,9 @@ Este documento registra de forma técnica e objetiva as inconsistências, fragil
 | **11** | Histórico de sessão inclui faixas enfileiradas e ainda não tocadas | `replenish_mpd_queue` (`mpd_integration.py`) | **Recomendação Audível** (skips em sequência reduzem o conjunto de candidatas) |
 | **12** | Nível de emergência da busca ignora o cooldown de gênero | `select_next_recommendations` (`mpd_integration.py`) | **Recomendação Audível** (só quando nenhuma faixa elegível sobra) |
 | **13** | Correção dos skips validada apenas em Linux, com áudio sintético | `test_skip_sequencial.py` e ensaio descrito em `recomendacao_e_fila.md` | **Validação** (não confirmada no MPD do Windows nem com o CLAP) |
+| **14** | `FeedbackStorage` abre uma conexão SQLite por consulta | `FeedbackStorage._get_connection` (`feedback.py`) | **Recomendação Audível** (custo alto no Windows; mitigado por cache por gênero) |
+| **15** | Tempo ouvido depende dos eventos do MPD | `PlaybackClock` (`mpd_integration.py`) | **Recomendação Audível** (erro de alguns segundos perto dos limiares) |
+| **16** | Modo aleatório do MPD é desligado automaticamente | `FORCE_SEQUENTIAL_PLAYBACK` (`mpd_integration.py`) | **Uso** (sem shuffle com o recomendador ativo) |
 
 ---
 
@@ -161,3 +164,22 @@ Este documento registra de forma técnica e objetiva as inconsistências, fragil
 ### 2.13. Validação da Correção de Skips Restrita ao Ambiente de Ensaio
 - **O que foi feito:** ensaio em Linux (MPD 0.23.14), com o código real, o módulo de feedback real e uma cópia do ChromaDB real, mas com áudio sintético e sem executar o CLAP.
 - **O que não foi confirmado:** o comportamento no MPD do Windows (o MPD remove o campo `song` do status ao esgotar a fila; verificado no MPD 0.23.14) e o desempenho com o tempo real de inferência do CLAP.
+
+---
+
+### 2.14. Uma Conexão SQLite por Consulta
+- **O que o código faz:** `FeedbackStorage._get_connection` abre e fecha uma conexão (com `PRAGMA journal_mode=WAL`) a cada consulta. No re-ranking isso era feito por candidata; hoje é feito uma vez por gênero.
+- **Impacto:** cada consulta ainda custa uma conexão. No Windows (antivírus, pasta sincronizada) o custo por conexão é maior que no Linux e foi a causa dominante da lentidão medida (ver [recomendacao_e_fila.md](recomendacao_e_fila.md), seção 7).
+- **Melhoria possível, não feita:** conexão persistente por thread. Exige cuidado com o uso concorrente entre o recomendador e o monitor (WAL).
+
+---
+
+### 2.15. Tempo Ouvido Depende dos Eventos do MPD
+- **O que o código faz:** o tempo ouvido é acompanhado pelo `PlaybackClock`, que re-ancora no `elapsed` do MPD a cada evento `player` da faixa e avança pelo relógio de parede entre eventos (ver [feedback_implicito.md](feedback_implicito.md), seção 1.1).
+- **Impacto:** um seek não é percebido até chegar um evento do MPD; se o sistema for iniciado com uma faixa já tocando, o tempo é contado a partir do `elapsed` daquele momento. A classificação pode errar por alguns segundos perto dos limiares de 30 s e 80%.
+
+---
+
+### 2.16. Modo Aleatório Desligado Automaticamente
+- **O que o código faz:** `FORCE_SEQUENTIAL_PLAYBACK = True` desliga o `random` do MPD sempre que o encontra ligado (ver [recomendacao_e_fila.md](recomendacao_e_fila.md), seção 8).
+- **Impacto:** quem quiser shuffle no Cantata não consegue com o recomendador ativo. Os modos `single` e `consume` do MPD não são tratados.

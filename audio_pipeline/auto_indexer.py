@@ -4,8 +4,18 @@ import logging
 import numpy as np
 
 from fingerprint import generate_fingerprint, find_duplicate_by_fingerprint
-from pipeline import process_track
 import vector_store
+
+
+def process_track(*args, **kwargs):
+    """Importação tardia de pipeline.process_track.
+
+    O módulo `pipeline` importa torch e transformers (CLAP), o que leva vários segundos. Só é necessário
+    quando uma faixa realmente precisa ser indexada; no uso normal (biblioteca já indexada) não é carregado.
+    """
+    from pipeline import process_track as _process_track
+    return _process_track(*args, **kwargs)
+
 
 logger = logging.getLogger(__name__)
 

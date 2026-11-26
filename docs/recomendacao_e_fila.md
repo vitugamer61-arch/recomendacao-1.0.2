@@ -27,6 +27,7 @@ A faixa em reprodução é identificada pelo `songid` (campo `id` de `currentson
 - **Exclusão mútua:** "decidir + enfileirar" ocorre sob `RECOMMENDER_CYCLE_LOCK`, com dupla checagem do `songid` dentro do lock.
 - **Feedback implícito:** antes de decidir, a transição da faixa anterior é avaliada (skip, parcial ou completa; ver [feedback_implicito.md](feedback_implicito.md)).
 - **Faixa desconhecida:** se o arquivo não está no índice, `auto_indexer.index_unknown_track` o indexa sob demanda antes de recomendar.
+- **Início com o MPD já tocando:** o MPD só emite evento quando algo muda. Se ele já estiver tocando quando o monitor inicia (o MPD pode restaurar o estado anterior pelo `state_file`), o monitor processa a faixa atual imediatamente, sem esperar a próxima troca; do contrário o sistema pareceria parado.
 
 Consequências (decorrem da lógica acima):
 
@@ -87,7 +88,7 @@ Rejeições por feedback **não** são resolvidas pelo relaxamento do histórico
 | 2 | coleção inteira | aplicado |
 | 3 (emergência) | coleção inteira | **ignorado** |
 
-Os níveis 1 e 2 continuam respeitando cooldown e skips recentes, então tendem a encontrar faixas de **outros gêneros**. Só o nível 3 ignora o feedback, para que a música nunca pare. Ele só é atingido se nenhuma faixa elegível sobrar nos níveis anteriores. `None` só é devolvido quando realmente não há faixa elegível (tudo na fila, no histórico mínimo ou em `failed_tracks`).
+Os níveis 1 e 2 continuam respeitando cooldown e skips recentes, então tendem a encontrar faixas de **outros gêneros**. Só o nível 3 ignora o feedback, para que a música nunca pare. Se todos os gêneros estiverem em cooldown ao mesmo tempo (muitos skips em todos eles), os níveis 1 e 2 não têm como achar nada e a decisão termina no nível 3; por isso o custo de cada nível importa (seção 7). Ele só é atingido se nenhuma faixa elegível sobrar nos níveis anteriores. `None` só é devolvido quando realmente não há faixa elegível (tudo na fila, no histórico mínimo ou em `failed_tracks`).
 
 ### 3.5. Modos de seleção (`SELECTION_MODE`)
 
@@ -105,6 +106,7 @@ Objetivo: a cada ciclo, deixar `MIN_QUEUE_AHEAD = 2` recomendações novas logo 
 - **Colchão de segurança:** as pendências antigas do recomendador **não** são removidas antes do cálculo; assim a fila nunca fica a zero durante o processamento.
 - **Inserção ordenada:** `addid` na posição `song + 1 + n_adicionadas` (logo após a faixa atual), de modo que a faixa escolhida (top-1) seja sempre a próxima e as demais venham em seguida, por score. Sem faixa corrente (`song` ausente), as faixas são acrescentadas ao fim da playlist.
 - **Decisão única:** somente a primeira recomendação do ciclo grava a decisão no SQLite; as demais se vinculam a ela.
+- **Nível de busca reaproveitado:** se a 1ª recomendação do ciclo precisou do nível N (seção 3.4), a 2ª parte do nível N, em vez de refazer os níveis que acabaram de falhar para a mesma semente.
 - **Descarte por corrida:** se o `songid` da faixa em reprodução mudou durante o cálculo (o usuário pulou), a reposição daquele ciclo é descartada, pois o próximo evento recalcula a partir da faixa nova.
 - **Swap:** após inserir as novas faixas, as pendências antigas do recomendador são removidas (`mpd_purge_pending_recommendations` com `exclude_songids`). A faixa atual e as anteriores nunca são removidas.
 - **Limite de tentativas:** `MAX_REPLENISH_TRIES = 5` por ciclo, para nunca bloquear a thread.
@@ -171,3 +173,59 @@ Ao dar skips em sequência, a recomendação parava e o player ficava em `stop`.
 - **Testes unitários:** `audio_pipeline/test_skip_sequencial.py` (9 testes). Contra o código anterior, 4 falham (exatamente os casos do bug) e 5 (comportamento preservado) passam.
 
 Limites desta validação: o ambiente foi Linux, com áudio sintético e sem o MPD do Windows. A parte "fim da fila ⇒ `song` ausente" é comportamento do próprio MPD, mas não foi confirmada no Windows.
+
+---
+
+## 7. Tempo de Resposta da Recomendação
+
+### 7.1. Sintoma
+
+Em uso real, cada decisão levava de 17 a 30 s (log com `Expandindo a busca...` em todos os níveis e todos os gêneros em cooldown, com penalidades de 3 a 5 em cada um).
+
+### 7.2. Causa
+
+Dentro de `FeedbackEngine.rerank_candidates`, o cooldown era consultado **uma vez por candidata** (`is_genre_in_cooldown`), e cada consulta abre uma conexão SQLite nova (`sqlite3.connect` + `PRAGMA journal_mode=WAL`; ao fechar a última conexão em WAL, o SQLite faz checkpoint e remove os arquivos `-wal` e `-shm`). Como o cooldown depende só do gênero (7 valores), a mesma resposta era recalculada centenas de vezes. Com a busca ampliada (300 e depois 1.288 candidatas), uma única decisão chegava a milhares de conexões (3.252 chamadas medidas).
+
+### 7.3. Correção
+
+- O cooldown passou a ser calculado **uma vez por gênero** em cada chamada de re-ranking (no máximo 7 consultas, e não uma por candidata).
+- O nível de busca necessário fica reaproveitado dentro do ciclo de reposição (seção 4).
+
+### 7.4. Medição
+
+Tempo de `select_next_recommendations` percorrendo os níveis 0 a 3, com todos os gêneros em cooldown, sobre a cópia real do ChromaDB (1.288 faixas):
+
+| Cenário | Antes | Depois |
+| :-- | :-: | :-: |
+| Sandbox Linux (conexão SQLite ~0,1 ms) | 1,3 s | 0,35 s |
+| Latência de conexão simulada de 2,7 ms | 11,4 s | 0,6 a 0,7 s |
+
+A latência de 2,7 ms é um valor **inferido** do log do usuário (17 a 20 s ÷ ~6.500 conexões); não foi medida no Windows. Antes da correção, 63% do tempo (1,1 s) estava em `is_genre_in_cooldown`.
+
+---
+
+## 8. Modo Aleatório do MPD (`random`)
+
+### 8.1. Sintoma
+
+O "Detalhamento da Última Decisão" mostrava como escolhida a faixa de rank #1, mas tocava outra. No log, a faixa de `songid=66` tocou e a de `songid=65` (a escolhida, na posição imediatamente seguinte) ficou para trás: o ciclo seguinte inseriu em `song + 1 = 4`, ou seja, a faixa atual estava na posição 3, e não na 2.
+
+### 8.2. Causa
+
+Com o modo `random` do MPD ligado (o botão de aleatório do Cantata), o MPD escolhe a próxima faixa pela ordem aleatória interna e **ignora a posição na fila**. A decisão e a fila continuam corretas (a escolhida fica na posição `song + 1`), mas o player toca outra. O código não tratava `random` em nenhum ponto.
+
+### 8.3. Correção
+
+`monitor_and_recommend` verifica o campo `random` do status na partida e a cada evento; se estiver ligado, desliga (`client.random(0)`) e registra um aviso no log. A constante `FORCE_SEQUENTIAL_PLAYBACK = True` (em `mpd_integration.py`) controla isso; com `False`, o shuffle é permitido, mas a próxima faixa tocada deixa de ser a escolhida pela decisão.
+
+### 8.4. Medição
+
+Teste no MPD real (0.23.14) comparando, a cada ciclo, a faixa escolhida pela decisão, a próxima da fila e a faixa que tocou (12 ciclos, com skip, reprodução parcial e completa):
+
+| Modo do MPD | Decisão ≠ próxima da fila | Tocou ≠ próxima da fila |
+| :-- | :-: | :-: |
+| `random` desligado | 0 de 12 | 0 de 12 |
+| `random` ligado, código anterior | 0 de 12 | **6 de 12** |
+| `random` ligado, código corrigido | 0 de 12 | 0 de 12 |
+
+Não foi confirmado que o seu MPD estava em modo aleatório; a hipótese se apoia no log (salto de posição) e na reprodução do mesmo sintoma. Para conferir: botão de aleatório do Cantata, ou `mpc status` (campo `random: on`).

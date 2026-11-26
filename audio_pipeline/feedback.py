@@ -57,6 +57,24 @@ def clean_mpd_filepath(raw_path: str) -> str:
 
 # ── 1. PERSISTÊNCIA SQLITE (FEEDBACK STORAGE) ────────────────────────────────
 
+_COLUNAS_FEEDBACK_EVENTS = ["id", "timestamp", "track_id", "caminho", "genero", "cluster_id", "tipo", "peso", "elapsed", "duration"]
+
+_DDL_FEEDBACK_EVENTS = """
+    CREATE TABLE IF NOT EXISTS feedback_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        track_id TEXT NOT NULL,
+        caminho TEXT,
+        genero TEXT,
+        cluster_id TEXT,
+        tipo TEXT NOT NULL,       -- 'skip', 'parcial', 'completa'
+        peso REAL DEFAULT 1.0,    -- negativo para skip (-1.0), positivo fraco (f) ou forte (1.0)
+        elapsed REAL,
+        duration REAL
+    )
+"""
+
+
 class FeedbackStorage:
     """
     Gerenciador de persistência SQLite com suporte a WAL mode para leitura concorrente.
@@ -98,26 +116,39 @@ class FeedbackStorage:
                 pass
             self._mem_conn = None
 
+    def _migrar_feedback_events_sem_check(self, cursor) -> None:
+        """Reconstrói feedback_events sem o CHECK antigo, preservando todos os eventos já gravados."""
+        logger.warning("Migrando feedback_events: removendo restrição antiga que rejeitava eventos 'parcial'.")
+        cursor.execute("PRAGMA table_info(feedback_events)")
+        colunas_antigas = [c[1] for c in cursor.fetchall()]
+        cursor.execute("ALTER TABLE feedback_events RENAME TO feedback_events_antiga")
+        for idx in ("idx_fb_track", "idx_fb_tipo", "idx_fb_time", "idx_fb_genero"):
+            cursor.execute(f"DROP INDEX IF EXISTS {idx}")
+        cursor.execute(_DDL_FEEDBACK_EVENTS)
+        comuns = [c for c in _COLUNAS_FEEDBACK_EVENTS if c in colunas_antigas]
+        lista = ", ".join(comuns)
+        cursor.execute(f"INSERT INTO feedback_events ({lista}) SELECT {lista} FROM feedback_events_antiga")
+        if "peso" not in colunas_antigas:
+            # Versões sem a coluna 'peso': atribui o sinal correto por tipo (skip negativo, completa positivo)
+            cursor.execute("UPDATE feedback_events SET peso = CASE tipo WHEN 'skip' THEN -1.0 WHEN 'completa' THEN 1.0 ELSE peso END")
+        cursor.execute("DROP TABLE feedback_events_antiga")
+
     def _init_db(self) -> None:
         """Cria as tabelas e índices necessários no SQLite."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
             # Tabela de eventos de reprodução / feedback
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS feedback_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    track_id TEXT NOT NULL,
-                    caminho TEXT,
-                    genero TEXT,
-                    cluster_id TEXT,
-                    tipo TEXT NOT NULL,       -- 'skip', 'parcial', 'completa'
-                    peso REAL DEFAULT 1.0,    -- negativo para skip (-1.0), positivo fraco (f) ou forte (1.0)
-                    elapsed REAL,
-                    duration REAL
-                )
-            """)
+            cursor.execute(_DDL_FEEDBACK_EVENTS)
+
+            # Migração: bancos criados por versões antigas têm CHECK(tipo IN ('skip','completa')), que rejeita
+            # eventos 'parcial' ("CHECK constraint failed: tipo IN ('skip', 'completa')") e os descarta em silêncio.
+            # CREATE TABLE IF NOT EXISTS não altera uma tabela já existente, então ela precisa ser reconstruída.
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='feedback_events'")
+            _row = cursor.fetchone()
+            _ddl_atual = (_row[0] if _row and _row[0] else "")
+            if "CHECK" in _ddl_atual.upper() and "parcial" not in _ddl_atual.lower():
+                self._migrar_feedback_events_sem_check(cursor)
 
             # Migração caso a coluna 'peso' ainda não exista
             cursor.execute("PRAGMA table_info(feedback_events)")
@@ -876,6 +907,9 @@ class FeedbackEngine:
 
         norm_q = query_emb / (np.linalg.norm(query_emb) + 1e-9)
         scored_candidates = []
+        # O cooldown depende só do gênero (poucos valores) e cada consulta abre uma conexão SQLite nova.
+        # Calcular uma vez por gênero (e não uma vez por candidata) evita milhares de conexões por decisão.
+        cooldown_por_genero: Dict[str, bool] = {}
 
         for cand in candidates:
             cid = cand["track_id"]
@@ -902,7 +936,9 @@ class FeedbackEngine:
                 continue
 
             # 3. Filtro de cooldown: 3+ skips no mesmo gênero
-            if c_gen and self.storage.is_genre_in_cooldown(c_gen):
+            if c_gen and c_gen not in cooldown_por_genero:
+                cooldown_por_genero[c_gen] = self.storage.is_genre_in_cooldown(c_gen)
+            if c_gen and cooldown_por_genero[c_gen]:
                 motivo = f"Rejeitada (cooldown do gênero '{c_gen}')"
                 cand["motivo"] = motivo
                 cand["rejeitada"] = True

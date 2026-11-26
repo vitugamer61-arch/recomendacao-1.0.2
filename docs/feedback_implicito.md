@@ -12,6 +12,16 @@ O sistema aprende com o comportamento de escuta, sem pedir avaliações. Cada tr
 
 Ao detectar a troca de faixa (ver [recomendacao_e_fila.md](recomendacao_e_fila.md), seção 1), o monitor avalia a faixa **anterior** com o tempo ouvido (`elapsed`) e a duração.
 
+### 1.1. De onde vem o tempo ouvido
+
+Depois da troca, o status do MPD já é o da faixa nova, e o status guardado no **início** da faixa anterior tem `elapsed ≈ 0`. Usar esse valor classificava **toda** troca como `skip`, inclusive faixas ouvidas até o fim (caso observado: faixa de 169 s tocada por 169 s registrada como `Tempo=0.0s/169.0s`). Por isso o monitor mantém um relógio de reprodução (`PlaybackClock`):
+
+- ancora no `elapsed` informado pelo MPD a cada evento da faixa (início, retomada após pausa, seek);
+- avança com o relógio de parede enquanto a faixa toca e congela em pausa ou stop;
+- na troca, entrega ao detector o status da faixa anterior com `elapsed` e `time` corrigidos (limitados à duração).
+
+Verificado no MPD real: em 12 ações (4 skips, 2 parciais, 6 completas), antes da correção o banco registrou 12 `skip`; depois, 4 `skip`, 2 `parcial` e 6 `completa`.
+
 Não geram evento: gatilhos automáticos, navegação para uma faixa **anterior** na playlist (`nova posição < antiga`) e faixas sem duração conhecida. Nos demais casos, em ordem:
 
 | Regra | Condição | Tipo | Peso |
@@ -34,6 +44,12 @@ Modo WAL ativo, para permitir acesso concorrente entre recomendador e monitor.
 | `decisoes` | auditoria de cada decisão do recomendador (semente, faixa escolhida, origem `recomendada`/`exploracao`/`manual`, gatilho), usada no acompanhamento em tempo real do monitor |
 | `mpd_queue_state` | espelho da fila do MPD (posição, `songid`, origem, status `Tocada`/`Tocando`/`Na fila`) |
 | `mpd_song_ownership` | registra quais `songid` foram inseridos pelo recomendador (origem `recomendada`/`exploracao`) e a decisão que os originou |
+
+---
+
+### 2.1. Migração de bancos antigos
+
+Bancos criados por versões antigas têm `CHECK(tipo IN ('skip','completa'))` em `feedback_events`. Nesse caso todo evento `parcial` era rejeitado (`CHECK constraint failed`) e descartado, e o Rocchio ficava sempre com 0 positivos. Como `CREATE TABLE IF NOT EXISTS` não altera uma tabela existente, `FeedbackStorage` agora detecta o `CHECK` antigo ao abrir o banco e reconstrói a tabela sem ele, **preservando os eventos já gravados**. Se o banco antigo não tinha a coluna `peso`, ela é preenchida com o sinal correto por tipo (skip −1,0; completa +1,0).
 
 ---
 
@@ -76,6 +92,8 @@ Pontuação cumulativa por gênero: **+1,0** por skip, **−0,5** por faixa comp
 
 Se o usuário pula **3 ou mais** faixas do mesmo gênero dentro de uma janela de **600 s**, o gênero é bloqueado por **300 s**.
 
+O cooldown é avaliado **uma vez por gênero** em cada re-ranking (e não por candidata), pois cada avaliação abre uma conexão SQLite.
+
 Efeito colateral importante: com skips seguidos, a vizinhança inteira de uma faixa pode pertencer a um gênero em cooldown, e todas as 50 candidatas são rejeitadas. Para a música não parar, `select_next_recommendations` amplia a busca em níveis (ver [recomendacao_e_fila.md](recomendacao_e_fila.md), seção 3.4): os níveis 1 e 2 procuram faixas de outros gêneros respeitando o cooldown, e só o nível 3 (emergência) o ignora.
 
 ---
@@ -83,4 +101,4 @@ Efeito colateral importante: com skips seguidos, a vizinhança inteira de uma fa
 ## 6. Testes
 
 - `audio_pipeline/test_feedback.py`: detecção (skip real, fim natural, navegação para trás, gatilho automático), Rocchio, re-ranking, cooldown de gênero, sincronização do estado da fila, e regressões de fila/propriedade das faixas, skips rápidos e cenários A a D (skip durante o cálculo, fila esgotada com retomada automática, parada manual respeitada, rajada de 5 skips).
-- `audio_pipeline/test_skip_sequencial.py`: fim da fila **sem o campo `song`** (comportamento real do MPD), parada manual, MPD ocioso, dois fins de fila seguidos e expansão da busca.
+- `audio_pipeline/test_skip_sequencial.py`: fim da fila **sem o campo `song`** (comportamento real do MPD), parada manual, MPD ocioso, dois fins de fila seguidos, expansão da busca, cooldown por gênero, migração do banco antigo, nível de busca reaproveitado, início com o MPD tocando, modo aleatório e classificação com o tempo ouvido real (skip, parcial, completa e pausa).

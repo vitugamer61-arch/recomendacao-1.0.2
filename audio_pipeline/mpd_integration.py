@@ -41,6 +41,9 @@ CANDIDATES_K = 20
 SELECTION_MODE = "random_top_n"  # "random_top_n", "first", ou "mmr"
 TOP_N_VARIETY = 3
 AUTO_RESUME_PLAY_ON_STOP = True  # Retomar play se o MPD parar com fila esgotada (padrão ativada)
+# Desliga o modo aleatório (random) do MPD. Com ele ligado o MPD toca uma faixa DIFERENTE da que a decisão enfileirou
+# como próxima (a decisão e a fila ficam corretas, mas o player ignora a ordem). Defina False para permitir o shuffle.
+FORCE_SEQUENTIAL_PLAYBACK = True
 MAX_REPLENISH_TRIES = 5  # Limite de tentativas no loop de reposição para nunca travar a thread
 # Expansão progressiva da busca quando TODAS as candidatas são rejeitadas (cooldown de gênero, skips recentes,
 # histórico). Evita que uma sequência de skips deixe a fila sem recomendação e o MPD pare.
@@ -501,7 +504,7 @@ def select_next_recommendations(
     seed_songid: str = "",
     gatilho: str = "player",
     record_audit: bool = True,
-    _expand_level: int = 0
+    nivel_busca: int = 0
 ) -> tuple[str, dict, int] | None:
     """
     Seleciona a melhor candidata evitando histórico, fila atual e faixas com falha.
@@ -531,7 +534,7 @@ def select_next_recommendations(
     search_emb = query_emb
     feedback_engine = None
     roc_stats: dict = {}
-    emergency = _expand_level >= MAX_EXPANSION_LEVEL
+    emergency = nivel_busca >= MAX_EXPANSION_LEVEL
     if use_feedback and HAS_FEEDBACK:
         try:
             feedback_engine = feedback.FeedbackEngine()
@@ -544,9 +547,9 @@ def select_next_recommendations(
 
     similares = []
     search_k = feedback_config.CANDIDATES_N if (use_feedback and HAS_FEEDBACK) else k
-    if _expand_level == 1:
+    if nivel_busca == 1:
         search_k = search_k * SEARCH_EXPANSION_FACTOR
-    elif _expand_level >= 2:
+    elif nivel_busca >= 2:
         try:
             search_k = max(search_k, int(collection.count()))
         except Exception:
@@ -684,20 +687,20 @@ def select_next_recommendations(
             valid_candidates = filter_candidates(set(temp_hist))
 
     if not valid_candidates:
-        if _expand_level < MAX_EXPANSION_LEVEL:
+        if nivel_busca < MAX_EXPANSION_LEVEL:
             logging.warning(
-                f"Nenhuma candidata válida (nível de busca {_expand_level}). "
-                f"Expandindo a busca para o nível {_expand_level + 1}."
+                f"Nenhuma candidata válida (nível de busca {nivel_busca}). "
+                f"Expandindo a busca para o nível {nivel_busca + 1}."
             )
             if msg_queue:
-                msg_queue.put({"type": "log", "text": f"Sem candidatas: ampliando a busca (nível {_expand_level + 1})"})
+                msg_queue.put({"type": "log", "text": f"Sem candidatas: ampliando a busca (nível {nivel_busca + 1})"})
             return select_next_recommendations(
                 collection=collection, current_track_id=current_track_id, id_to_file_map=id_to_file_map,
                 k=k, history=history, queued_files=queued_files, failed_tracks=failed_tracks,
                 selection_mode=selection_mode, top_n=top_n, random_seed=random_seed, msg_queue=msg_queue,
                 recommendation_mode=recommendation_mode, use_feedback=use_feedback,
                 seed_songid=seed_songid, gatilho=gatilho, record_audit=record_audit,
-                _expand_level=_expand_level + 1
+                nivel_busca=nivel_busca + 1
             )
         return None
 
@@ -802,6 +805,7 @@ def select_next_recommendations(
         except Exception as e:
             logging.warning(f"Erro ao registrar auditoria no feedback.db: {e}")
 
+    chosen_rec['nivel_busca'] = nivel_busca  # permite ao replenish não refazer níveis que já falharam
     return chosen_file, chosen_rec, chosen_rank
 
 def replenish_mpd_queue(
@@ -869,6 +873,10 @@ def replenish_mpd_queue(
     except Exception as e:
         logging.debug(f"Falha ao checar faixa em reprodução: {e}")
 
+    # Nível de busca já necessário neste ciclo: a 2ª recomendação parte dele, em vez de refazer os níveis que
+    # acabaram de falhar para a mesma semente (cada nível custa uma busca ampliada + re-ranking).
+    nivel_busca_ciclo = 0
+
     while added_count < min_queue_ahead and attempts < max_tries:
         attempts += 1
 
@@ -901,7 +909,8 @@ def replenish_mpd_queue(
             use_feedback=use_feedback,
             seed_songid=seed_songid,
             gatilho=gatilho,
-            record_audit=record_audit
+            record_audit=record_audit,
+            nivel_busca=nivel_busca_ciclo
         )
 
         if not selection:
@@ -911,6 +920,7 @@ def replenish_mpd_queue(
             break
 
         candidate_file, candidate_rec, candidate_rank = selection
+        nivel_busca_ciclo = max(nivel_busca_ciclo, int(candidate_rec.get('nivel_busca', 0)))
         candidate_id = candidate_rec['track_id']
         dist = candidate_rec.get('distance', 0.0)
 
@@ -1012,6 +1022,77 @@ def replenish_mpd_queue(
 
     return added_count
 
+def _to_float(valor, padrao: float = 0.0) -> float:
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return padrao
+
+
+def _desligar_modo_aleatorio(client) -> None:
+    """Desliga o `random` do MPD e avisa, pois ele faz tocar uma faixa diferente da escolhida pela decisão."""
+    try:
+        client.random(0)
+        logging.warning(
+            "O modo aleatório (random) do MPD estava ligado e foi desligado: com ele o MPD toca uma faixa diferente "
+            "da escolhida pela decisão do recomendador. Para permitir o shuffle, defina FORCE_SEQUENTIAL_PLAYBACK = False."
+        )
+    except Exception as e:
+        logging.warning(f"Não foi possível desligar o modo aleatório do MPD: {e}")
+
+
+class PlaybackClock:
+    """Quanto tempo a faixa atual foi ouvida, para classificar skip/parcial/completa quando o usuário a troca.
+
+    O MPD não informa o tempo ouvido da faixa ANTERIOR depois da troca (o status já é o da nova faixa), e o status
+    guardado no início da faixa tem elapsed ~ 0. Por isso o tempo é acompanhado aqui: ancora no `elapsed` informado
+    pelo MPD a cada evento (início, retomada após pausa, seek) e avança com o relógio de parede enquanto toca.
+    """
+
+    def __init__(self):
+        self.songid = None
+        self._e0 = 0.0
+        self._t0 = 0.0
+        self._paused = True
+
+    def start(self, songid, elapsed=0.0, now=None) -> None:
+        self.songid = str(songid) if songid not in (None, "") else None
+        self.sync(elapsed, now)
+
+    def sync(self, elapsed, now=None) -> None:
+        self._e0 = max(0.0, _to_float(elapsed))
+        self._t0 = time.time() if now is None else now
+        self._paused = False
+
+    def pause(self, elapsed=None, now=None) -> None:
+        self._e0 = max(0.0, _to_float(elapsed)) if elapsed is not None else self.elapsed(now)
+        self._paused = True
+
+    def elapsed(self, now=None) -> float:
+        if self.songid is None:
+            return 0.0
+        if self._paused:
+            return self._e0
+        now = time.time() if now is None else now
+        return self._e0 + max(0.0, now - self._t0)
+
+
+def _status_com_tempo_ouvido(prev_status: dict, prev_song: dict, elapsed: float) -> dict:
+    """Cópia do status da faixa anterior com o tempo REALMENTE ouvido (o detector lê `time` e `elapsed`)."""
+    st = dict(prev_status)
+    total = 0.0
+    tv = st.get("time")
+    if tv and ":" in str(tv):
+        total = _to_float(str(tv).split(":")[1])
+    if total <= 0:
+        total = _to_float(st.get("duration", (prev_song or {}).get("duration", 0.0)))
+    if total > 0:
+        elapsed = min(elapsed, total)
+        st["time"] = f"{int(elapsed)}:{int(total)}"
+    st["elapsed"] = f"{elapsed:.3f}"
+    return st
+
+
 def monitor_and_recommend(
     client: MPDClient,
     collection,
@@ -1037,6 +1118,7 @@ def monitor_and_recommend(
     # Não depende de o monitor ter visto um `play` entre dois stops: com skips muito rápidos o MPD pode esgotar
     # a fila de novo antes de o monitor processar o evento da faixa retomada.
     session_active = False
+    playback_clock = PlaybackClock()
 
     # Inicializa detector de feedback se ativo
     feedback_detector = None
@@ -1096,12 +1178,28 @@ def monitor_and_recommend(
         msg_queue.put({"type": "status", "state": "monitorando"})
         update_counters()
     
+    # Se o MPD já estiver tocando quando o sistema inicia, nenhum evento 'player' virá até a próxima troca de faixa
+    # e o sistema pareceria parado. Nesse caso, processa a faixa atual imediatamente.
+    try:
+        _status_inicial = client.status()
+        processar_faixa_atual_ao_iniciar = (_status_inicial.get("state") == "play")
+        if FORCE_SEQUENTIAL_PLAYBACK and str(_status_inicial.get("random", "0")) == "1":
+            _desligar_modo_aleatorio(client)
+    except Exception:
+        processar_faixa_atual_ao_iniciar = False
+    if processar_faixa_atual_ao_iniciar:
+        logging.info("MPD já está tocando ao iniciar: recomendando a partir da faixa atual sem esperar um evento.")
+
     while True:
         try:
             client = reconnect_if_needed(client)
             
             # Requisito 1: Assinar/reagir apenas ao subsistema player (playlist e mixer são ignorados)
-            events = client.idle("player")
+            if processar_faixa_atual_ao_iniciar:
+                processar_faixa_atual_ao_iniciar = False
+                events = ["player"]
+            else:
+                events = client.idle("player")
             
             if "player" not in events:
                 logging.debug(f"[Subsistema Ignorado] Eventos recebidos sem player: {events}")
@@ -1109,7 +1207,12 @@ def monitor_and_recommend(
 
             status = client.status()
             state = status.get("state")
-            
+
+            if FORCE_SEQUENTIAL_PLAYBACK and str(status.get("random", "0")) == "1":
+                _desligar_modo_aleatorio(client)
+            if state == "pause":
+                playback_clock.pause(status.get("elapsed"))
+
             if state == "play":
                 session_active = True
                 current_song = client.currentsong()
@@ -1119,6 +1222,10 @@ def monitor_and_recommend(
                     continue
                     
                 current_file = normalize_mpd_filepath(raw_file, music_root)
+
+                # Mesma faixa (retomada após pausa, seek, evento autogerado): re-ancora o tempo ouvido no elapsed do MPD
+                if current_song_id and current_song_id == playback_clock.songid:
+                    playback_clock.sync(status.get("elapsed"))
 
                 # Requisito 2 & 3: Idempotência e supressão de eventos autogerados
                 # Se a faixa tocando for a mesma da última decisão, checa idempotência e supressão autogerada.
@@ -1148,9 +1255,14 @@ def monitor_and_recommend(
                     # Avaliação de feedback implícito (skip / completa) da faixa anterior
                     if feedback_detector and prev_song and prev_status:
                         try:
+                            # O status guardado no início da faixa anterior tem elapsed ~ 0: usa o tempo realmente ouvido
+                            if playback_clock.songid and playback_clock.songid == str(prev_song.get("id", "")):
+                                prev_status_ouvido = _status_com_tempo_ouvido(prev_status, prev_song, playback_clock.elapsed())
+                            else:
+                                prev_status_ouvido = prev_status
                             ev = feedback_detector.evaluate_transition(
                                 prev_song=prev_song,
-                                prev_status=prev_status,
+                                prev_status=prev_status_ouvido,
                                 current_song=current_song,
                                 current_status=status,
                                 meta_resolver=resolve_track_metadata
@@ -1162,6 +1274,7 @@ def monitor_and_recommend(
 
                     prev_song = current_song
                     prev_status = status
+                    playback_clock.start(current_song_id, status.get("elapsed"))
                         
                     logging.info(f"Usuário ouvindo: {current_file} (songid={current_song_id})")
                     if msg_queue:
@@ -1246,6 +1359,7 @@ def monitor_and_recommend(
                 # Fatos do MPD (verificados): um `stop` manual MANTÉM o campo `song` no status; já ao esgotar a fila
                 # (ex.: skips sequenciais além da última faixa) ou após `clear`, o MPD remove `song`, mas a playlist
                 # continua com todas as faixas já tocadas. Por isso `ahead = len(playlist)` NÃO indica fila pendente.
+                playback_clock.pause()
                 playlist = client.playlistinfo()
                 has_song = "song" in status
                 current_pos = int(status.get("song", -1))

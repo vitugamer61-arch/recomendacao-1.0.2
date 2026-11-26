@@ -22,6 +22,7 @@ Consulte a documentação completa em `docs/`:
 - [docs/feedback_implicito.md](docs/feedback_implicito.md): Skip/parcial/completa, Rocchio, re-ranking e cooldown de gênero.
 - [docs/clusterizacao.md](docs/clusterizacao.md): K-Means com refinamento por pureza, nomeação por gênero e atribuição incremental.
 - [docs/disponibilidade.md](docs/disponibilidade.md): Resultados medidos de disponibilidade, MTTR, carga e restauração.
+- [docs/inicializacao.md](docs/inicializacao.md): Etapas da inicialização, tempos registrados no console e o que foi feito para reduzir a espera.
 - [docs/indexacao.md](docs/indexacao.md): Comparação entre indexação em lote e indexação sob demanda (deduplicação por fingerprint).
 - [docs/avaliacao.md](docs/avaliacao.md): Métrica Precision@K, baseline aleatória e formulação matemática.
 - [docs/limitacoes.md](docs/limitacoes.md): Registro explícito de limitações conhecidas e inconsistências arquiteturais.
